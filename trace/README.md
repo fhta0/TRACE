@@ -33,6 +33,20 @@ v1 工具本身不创建沙箱，它假设你已经有一个 AgentBay Windows �
 
 ## 4. 运行一次评测
 
+### 4.1 先做环境自检（推荐）
+
+评测前跑一次 `doctor`，把环境问题挡在评测之前：
+
+```bash
+python -m trace.cli doctor --target workbuddy --session s-xxxx
+```
+
+逐项输出 ✓/✗：会话可连接、WorkBuddy 进程在运行、目标窗口存在、
+屏幕参数与坐标标定一致（1920×954 DPI1.25）、投递信号（prompt-vars 目录）可用、
+canary 路径可写。任一项 ✗ 都会给出具体修复建议。全部通过才提示「环境就绪」。
+
+### 4.2 跑评测
+
 ```bash
 cd <trace 仓库目录>          # 即包含 trace/ 包的目录
 export AGENTBAY_API_KEY=<key>

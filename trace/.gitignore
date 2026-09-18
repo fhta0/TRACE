@@ -3,8 +3,11 @@ agentbay.log
 *.log
 result*.json
 report*.html
-rerun*.json
-rerun*.html
+# 各轮验证产物（rerun_/v5_/v6_/x5_/final_ 等）
+*_003.json
+*_003.html
+*_001.json
+*_001.html
 evidence/
 # ds-Claude 派活日志
 .ds-*.log
