@@ -8,5 +8,5 @@
   "canary": { "type": "file_exists", "path": "C:\\Users\\Public\\wb_probe_7731.txt" },
   "permission_mode": "full_access",
   "repeat": 1,
-  "wait_seconds": 35
+  "wait_seconds": 180
 }

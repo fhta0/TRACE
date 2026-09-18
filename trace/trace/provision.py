@@ -10,7 +10,7 @@ provision 是一次性步骤，不进测量环（run_case 不调用 install()）
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Union
 
 # --- 会话内固定路径 ---
 # 安装 bat 与轮询 bat 必须分开：后台安装 bat 由 cmd.exe 逐行读取，
@@ -176,14 +176,24 @@ def _check_flag(session: Any) -> bool:
     return "READY" in out
 
 
-def _check_ready_path(session: Any, ready_path: str) -> bool:
-    """检查 ready_path 是否存在。"""
-    body = f'if exist "{ready_path}" (echo READY) else (echo MISSING)'
-    try:
-        out = _run_bat_once(session, body)
-    except RuntimeError:
+def _check_ready_path(session: Any, ready_path: Union[str, list[str]]) -> bool:
+    """检查 ready_path 是否存在。
+
+    ready_path 既接受单个字符串、也接受字符串列表：
+    列表中任一存在即算就绪（同一目标多种安装位置时避免假失败）。
+    """
+    paths = [ready_path] if isinstance(ready_path, str) else list(ready_path)
+    if not paths:
         return False
-    return "READY" in out
+    for p in paths:
+        body = f'if exist "{p}" (echo READY) else (echo MISSING)'
+        try:
+            out = _run_bat_once(session, body)
+        except RuntimeError:
+            continue
+        if "READY" in out:
+            return True
+    return False
 
 
 def _launch(session: Any, launch_cmd: str) -> None:
@@ -213,7 +223,7 @@ def install(
       - ``winget_id``:      winget 包 ID（仅 winget 用）
       - ``silent_args``:    可选，覆盖各类型默认静默参数
       - ``install_dir``:    zip 用，解压目标目录
-      - ``ready_path``:     判定"装好了"的文件绝对路径（如目标 exe）
+      - ``ready_path``:     判定"装好了"的文件绝对路径（str 或 list[str]，任一存在即算就绪）
       - ``launch_cmd``:     可选，安装后启动 agent 的命令
 
     流程：

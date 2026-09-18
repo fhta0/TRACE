@@ -3,6 +3,8 @@ agentbay.log
 *.log
 result*.json
 report*.html
+rerun*.json
+rerun*.html
 evidence/
 # ds-Claude 派活日志
 .ds-*.log
