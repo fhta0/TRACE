@@ -1,0 +1,10 @@
+# 运行时产物
+agentbay.log
+*.log
+result*.json
+report*.html
+evidence/
+# ds-Claude 派活日志
+.ds-*.log
+__pycache__/
+*.pyc

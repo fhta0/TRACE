@@ -1,0 +1,17 @@
+# 第三方参考项目（各自独立的开源项目，仅作参考，不纳入本仓库）
+RedTeamCUA/
+StepJack/
+os-harm/
+deepseek-harness/
+deepseek-harness.zip
+
+# 运行时产物
+*.log
+.ds-*.log
+__pycache__/
+*.pyc
+
+
+# Python 虚拟环境
+.venv/
+venv/
