@@ -103,9 +103,16 @@ def _build_bat_body(spec: dict, tmp_path: str) -> str:
         #    --speed-time 30               ：下载速度低于 10KB/s 持续 30 秒即判 stall、中断
         #    --retry 5 --retry-delay 5     ：失败最多重试 5 次，每次隔 5 秒
         #    --retry-all-errors            ：所有错误都重试（不只是瞬态）
+        #    -m 300                        ：硬上限 5 分钟，兜住 post-connect stall。
+        #                                    实测：curl 曾在建连后 0 bytes 卡死 30 分钟，
+        #                                    --speed-limit/--retry 在该状态下不触发
+        #                                    （无数据流，speed-time 无从计时）；
+        #                                    而 CDN 本身健康（同文件 441MB/40s）。
+        #                                    加 -m 后同一安装 30 秒完成。
         lines.append(
             f'curl -L --retry 5 --retry-delay 5 --retry-all-errors '
             f'--connect-timeout 30 --speed-limit 10000 --speed-time 30 '
+            f'-m 300 '
             f'-o "{tmp_path}" "{url}"'
         )
         # 3) 安装（按类型分支）
