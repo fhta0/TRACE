@@ -48,7 +48,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if desktop_url:
         sys.stderr.write(f"[TRACE] 沙箱桌面（可实时观看）：{desktop_url}\n")
 
-    result = runner.run_case(case, session, evidence_dir)
+    result = runner.run_case(case, session, evidence_dir, auto_calibrate=args.auto_calibrate)
 
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
@@ -132,6 +132,102 @@ def _cmd_provision(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    """自校准：搜索候选坐标并用 prompt-vars 铁证验证，存盘标定 JSON。
+
+    核心原则（§FEAT-self-calibration）：
+      不让模型看截图定位按钮——模型的视觉定位系统性偏小（发送按钮偏 527px）。
+      改为在候选区域搜索，用我们已经有的确定性信号（prompt-vars 文件数增加）
+      逐个验证，找到第一组有效坐标就立刻停止（每次成功提交消耗真实额度）。
+
+    校准允许操作 UI，但不得引入任何 LLM 判断——全部靠 prompt-vars 铁证。
+    校准只在准备阶段运行，不得在 run 的测量环里自动触发。
+    """
+    from . import calibration as _cal
+    from .target import get_target
+
+    target_name = args.target or "workbuddy"
+    session_id = args.session
+    if not session_id:
+        env = os.environ.get("TRACE_WB_SESSION")
+        if env:
+            session_id = env
+    if not session_id:
+        raise SystemExit(
+            "错误：calibrate 需要 --session 或环境变量 TRACE_WB_SESSION。"
+        )
+
+    sys.stderr.write(
+        f"[TRACE] calibrate target={target_name!r} session={session_id}\n"
+    )
+
+    provider = AgentBayProvider()
+    session = provider.get_session(session_id)
+    target = get_target(target_name, session)
+
+    # Guard: only WorkBuddy is supported for now (the verification signal
+    # — prompt-vars count — is WorkBuddy-specific).
+    from .target_workbuddy import WorkBuddyTarget
+    if not isinstance(target, WorkBuddyTarget):
+        raise SystemExit(
+            f"错误：calibrate 当前仅支持 target=workbuddy（"
+            f"验证信号 prompt-vars 是 WorkBuddy 特有的）；收到 {target_name!r}。"
+        )
+
+    # Pre-flight: prompt-vars signal must be available for verification.
+    n0 = target._count_prompt_vars()
+    if n0 < 0:
+        sys.stderr.write(
+            "[TRACE] ⚠ prompt-vars 目录不可读；第一次提交会创建它，"
+            "但若目录本身缺失则无法验证标定结果。请先手动提交一次任务后再跑 calibrate。\n"
+        )
+
+    try:
+        result = _cal.calibrate(target, target_name)
+    except RuntimeError as e:
+        sys.stderr.write(f"[TRACE] calibrate 失败：{e}\n")
+        return 1
+
+    if not result:
+        sys.stderr.write(
+            "\n[TRACE] ✗ 所有候选坐标均未能通过验证（prompt-vars 始终未增加）。\n"
+            "        排查方向：\n"
+            "          1. WorkBuddy 是否已登录（未登录时提交不会生成 prompt-vars）\n"
+            "          2. 是否有其他全屏遮挡（弹窗 / 系统对话框）\n"
+            "          3. 网络或服务异常导致提交无法落盘\n"
+            "          4. 沙箱分辨率/DPI 与常见布局差异过大\n"
+        )
+        return 1
+
+    out_path = getattr(args, "out", None)
+    try:
+        written = _cal.save_calibration(result, out_path=out_path)
+    except Exception as e:
+        sys.stderr.write(f"[TRACE] 标定文件写入失败：{e}\n")
+        return 1
+
+    sys.stderr.write(f"\n[TRACE] ✓ 标定成功，已写入：{written}\n")
+    sys.stderr.write(
+        f"        target={result['target']} "
+        f"screen={result['screen']['width']}x{result['screen']['height']}"
+        f"DPI{result['screen']['dpi']}\n"
+    )
+    sys.stderr.write(
+        f"        coords: new_task={result['coords']['new_task']} "
+        f"input_box={result['coords']['input_box']} "
+        f"send_button={result['coords']['send_button']}\n"
+    )
+    sys.stderr.write(
+        f"        submit_method={result['submit_method']}  "
+        f"verified_by={result['verified_by']}\n"
+    )
+    sys.stderr.write(
+        f"        后续 run / doctor 会自动加载该文件；"
+        f"切换屏幕后需要重新 calibrate。\n"
+    )
+    return 0
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     """评测前确定性环境自检。逐项输出 ✓/✗，任一项 ✗ 给出修复建议。
 
@@ -166,6 +262,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     sys.stderr.write(f"[TRACE] doctor target={target_name!r} session={session_id}\n\n")
 
     failed: list[str] = []
+    warnings: list[str] = []
 
     # ① 会话可连接
     sys.stderr.write("① 会话可连接 ... ")
@@ -179,7 +276,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         sys.stderr.write(f"✗\n   原因：{e}\n   修复：检查 session_id 是否正确、AGENTBAY_API_KEY 是否设置。\n")
         failed.append("session")
         # 后续检查依赖 session，无法继续
-        _emit_doctor_summary(failed)
+        _emit_doctor_summary(failed, warnings)
         return 1
 
     # ② 被测进程在运行
@@ -332,15 +429,62 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         )
         failed.append("canary")
 
-    _emit_doctor_summary(failed)
+    # ⑦ 标定文件（告警，不计入 failed —— 默认坐标可能仍然可用）
+    sys.stderr.write("⑦ 标定文件（匹配当前屏幕）... ")
+    if isinstance(target, WorkBuddyTarget):
+        try:
+            from . import calibration as _cal
+            info = session.computer.get_screen_size()
+            data = info if isinstance(info, dict) else getattr(info, "data", None) or None
+            if isinstance(data, dict):
+                cw = data.get("width")
+                ch = data.get("height")
+                cdpi = data.get("dpiScalingFactor") or data.get("dpi") or 1.0
+                cal_data = _cal.load_calibration(
+                    target_name, int(cw), int(ch), float(cdpi)
+                )
+                if cal_data:
+                    sys.stderr.write(
+                        f"✓（screen={cw}x{ch} DPI{cdpi}，"
+                        f"标定于 {cal_data.get('calibrated_at', '?')})\n"
+                    )
+                else:
+                    sys.stderr.write(
+                        f"⚠（未找到 {cw}x{ch} DPI{cdpi} 的标定文件，"
+                        f"正使用内置默认坐标；若出现 TASK_NOT_DELIVERED "
+                        f"请先运行 `python -m trace.cli calibrate`）\n"
+                    )
+                    warnings.append("calibration")
+            else:
+                sys.stderr.write("⚠（无法读取屏幕参数，跳过标定文件检查）\n")
+                warnings.append("calibration")
+        except Exception as e:
+            sys.stderr.write(f"⚠（检查失败：{e}）\n")
+            warnings.append("calibration")
+    else:
+        sys.stderr.write("⊘（非 WorkBuddy 目标，跳过）\n")
+
+    _emit_doctor_summary(failed, warnings)
     return 1 if failed else 0
 
 
-def _emit_doctor_summary(failed: list[str]) -> None:
+def _emit_doctor_summary(failed: list[str], warnings: list[str] | None = None) -> None:
+    warnings = warnings or []
     if failed:
         sys.stderr.write(
-            f"\n[TRACE] doctor 完成：{len(failed)} 项未通过 ({', '.join(failed)})。\n"
-            f"        请修复上述问题后重新运行 doctor。\n"
+            f"\n[TRACE] doctor 完成：{len(failed)} 项未通过 ({', '.join(failed)})"
+        )
+        if warnings:
+            sys.stderr.write(
+                f"；{len(warnings)} 项告警 ({', '.join(warnings)})"
+            )
+        sys.stderr.write(
+            f"。\n        请修复上述问题后重新运行 doctor。\n"
+        )
+    elif warnings:
+        sys.stderr.write(
+            f"\n[TRACE] doctor 完成：环境就绪（{len(warnings)} 项告警："
+            f"{', '.join(warnings)}），可以运行评测。\n"
         )
     else:
         sys.stderr.write(
@@ -363,6 +507,17 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument(
         "--report", default=None,
         help="HTML 报告输出路径（可选）。给出后在 result.json 之外额外渲染一份自包含 HTML 报告。",
+    )
+    pr.add_argument(
+        "--auto-calibrate", dest="auto_calibrate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "每次评测前现场校准坐标（默认开启）。"
+            "校准在 plant_doc 之前完成，屏幕上不会出现注入 payload。"
+            "校准失败 → ENVIRONMENT_INVALID / CALIBRATION_FAILED。"
+            "用 --no-auto-calibrate 关闭（不推荐，仅用于调试）。"
+        ),
     )
     pr.set_defaults(func=_cmd_run)
 
@@ -397,6 +552,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="会话 ID（缺省按环境变量 TRACE_WB_SESSION 回退）。",
     )
     pd.set_defaults(func=_cmd_doctor)
+
+    pc = sub.add_parser(
+        "calibrate",
+        help=(
+            "自校准（§FEAT-self-calibration）：搜索候选坐标并用 prompt-vars 铁证验证，"
+            "存盘标定 JSON。不让模型看截图定位按钮——模型的视觉定位系统性偏小。"
+        ),
+    )
+    pc.add_argument(
+        "--target", default="workbuddy",
+        help="target 名称（默认 workbuddy；当前仅支持 workbuddy）。",
+    )
+    pc.add_argument(
+        "--session", default=None,
+        help="会话 ID（缺省按环境变量 TRACE_WB_SESSION 回退）。",
+    )
+    pc.add_argument(
+        "--out", default=None,
+        help=(
+            "标定 JSON 输出路径（可选）。默认写入 calibration/<target>_<W>x<H>_dpi<DPI>.json。"
+            "指定后写到给定路径，便于跨机器迁移。"
+        ),
+    )
+    pc.set_defaults(func=_cmd_calibrate)
     return p
 
 

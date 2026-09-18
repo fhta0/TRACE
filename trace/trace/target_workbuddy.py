@@ -34,6 +34,13 @@ _COORD_SEND_BUTTON = (1580, 534)   # 后备；默认仍走回车
 _COORD_POPUP_CLOSE_PANEL = (1780, 110)   # 右侧面板的 ✕
 _COORD_POPUP_CLOSE_CARD  = (351, 105)    # 内层卡片的 ✕
 
+# §FIX-calibration-v2：弹窗关闭按钮位置按屏幕比例换算（不再写死像素）。
+# 由 1920×954 下实测的两个 ✕ 位置反推：
+#   (1780, 110) -> (0.927, 0.104)   右侧面板 ✕
+#   (351,  105) -> (0.183, 0.099)   内层卡片 ✕
+# 换算后任何分辨率都能命中，避免「要关弹窗得先有坐标，而坐标正是要校准的」死锁。
+_POPUP_CLOSE_RATIOS = ((0.927, 0.104), (0.183, 0.099))
+
 # WorkBuddy 每次提交任务就在该目录新建一个 <uuid>.prompt-vars.json。
 # 这是确定性的「任务已提交」证据——不看屏幕、不受弹窗/DPI/布局影响。
 # §FIX-verified-steps：以此作为投递校验主信号。
@@ -48,6 +55,27 @@ _STABLE_POLLS = 3        # 连续多少次「画面无实质变化」才算完�
 # 投递校验轮询（提交后 prompt-vars 文件不一定瞬间落盘）
 _DELIVERY_POLL_INTERVAL = 1.0   # 秒
 _DELIVERY_POLL_TIMEOUT = 20.0   # 秒
+
+
+# ---------------------------------------------------------------------------
+# Screen-info helper (shared by instance method and calibration module)
+# ---------------------------------------------------------------------------
+def _get_screen_info(session: Any) -> dict | None:
+    """取当前屏幕参数。取不到返回 None。
+
+    SDK 返回结构在不同版本间不一致：可能是 dict 本身，也可能放在 .data 字段。
+    两种形式都兼容。
+    """
+    try:
+        sz = session.computer.get_screen_size()
+    except Exception:
+        return None
+    if isinstance(sz, dict):
+        return sz
+    data = getattr(sz, "data", None)
+    if isinstance(data, dict):
+        return data
+    return None
 
 
 def _screens_differ(a: bytes, b: bytes) -> bool:
@@ -72,6 +100,16 @@ class WorkBuddyTarget(Target):
 
     def __init__(self, session: Any):
         super().__init__(session)
+        # Instance-level coords: start at module defaults; overridden if a
+        # matching calibration file is found for the current screen.
+        self._coord_new_task: tuple[int, int] = _COORD_NEW_TASK
+        self._coord_input_box: tuple[int, int] = _COORD_INPUT_BOX
+        self._coord_send_button: tuple[int, int] | None = _COORD_SEND_BUTTON
+        self._coord_popup_close_panel: tuple[int, int] = _COORD_POPUP_CLOSE_PANEL
+        self._coord_popup_close_card: tuple[int, int] = _COORD_POPUP_CLOSE_CARD
+        self._submit_method: str = "enter"          # "enter" | "click"
+        self._calibration_loaded: bool = False
+        self._try_load_calibration()
 
     # --- 自动安装（provision）---
     def provision(self) -> None:
@@ -102,6 +140,63 @@ class WorkBuddyTarget(Target):
             ),
         })
 
+    # --- 标定文件加载（§FEAT-self-calibration）---
+    def _try_load_calibration(self) -> None:
+        """按当前屏幕参数查找 calibration/ 下匹配的标定文件，覆盖实例坐标。
+
+        匹配到 → 用文件里的坐标覆盖实例默认常量；
+        没匹配到 → 保留默认常量，并在 stderr 打一行提示。
+        仅运行一次（用 _calibration_loaded 门控）。
+        """
+        if self._calibration_loaded:
+            return
+        self._calibration_loaded = True
+
+        from . import calibration as _cal
+
+        info = _get_screen_info(self.session)
+        if not info:
+            return
+        width = info.get("width")
+        height = info.get("height")
+        dpi = info.get("dpiScalingFactor") or info.get("dpi") or 1.0
+        if not width or not height:
+            return
+        try:
+            width_i, height_i = int(width), int(height)
+            dpi_f = float(dpi)
+        except (TypeError, ValueError):
+            return
+
+        data = _cal.load_calibration("workbuddy", width_i, height_i, dpi_f)
+        if not data:
+            sys.stderr.write(
+                f"[TRACE] 未找到当前屏幕({width_i}x{height_i} DPI{dpi_f})的标定文件，"
+                f"正在使用内置默认坐标，若出现 TASK_NOT_DELIVERED "
+                f"请先运行 `python -m trace.cli calibrate`\n"
+            )
+            return
+
+        coords = data.get("coords") or {}
+        if coords.get("new_task"):
+            self._coord_new_task = tuple(coords["new_task"])  # type: ignore[assignment]
+        if coords.get("input_box"):
+            self._coord_input_box = tuple(coords["input_box"])  # type: ignore[assignment]
+        sb = coords.get("send_button")
+        self._coord_send_button = tuple(sb) if sb else None  # type: ignore[assignment]
+        pcs = data.get("popup_close") or []
+        if len(pcs) >= 2:
+            self._coord_popup_close_panel = tuple(pcs[0])  # type: ignore[assignment]
+            self._coord_popup_close_card = tuple(pcs[1])   # type: ignore[assignment]
+        if data.get("submit_method"):
+            self._submit_method = data["submit_method"]
+
+        sys.stderr.write(
+            f"[TRACE] 已加载标定文件：screen={width_i}x{height_i} DPI{dpi_f} "
+            f"new_task={self._coord_new_task} input_box={self._coord_input_box} "
+            f"submit={self._submit_method}\n"
+        )
+
     # --- 文档投放 ---
     def plant_doc(self, filename: str, content: str) -> str:
         """把文档写到桌面，返回完整路径。"""
@@ -114,13 +209,13 @@ class WorkBuddyTarget(Target):
     # --- 任务交互（底层原子操作）---
     def new_task(self) -> None:
         """点击新建任务按钮，等待 UI 响应。"""
-        x, y = _COORD_NEW_TASK
+        x, y = self._coord_new_task
         self.session.computer.click_mouse(x, y)
         time.sleep(3)
 
     def focus_input(self) -> None:
         """点击输入框。"""
-        x, y = _COORD_INPUT_BOX
+        x, y = self._coord_input_box
         self.session.computer.click_mouse(x, y)
         time.sleep(1)
 
@@ -130,12 +225,16 @@ class WorkBuddyTarget(Target):
         time.sleep(1)
 
     def send_task(self) -> None:
-        """回车发送任务（WorkBuddy 输入框回车即发送）。
+        """提交任务：按标定文件的 submit_method 选择回车或点击发送按钮。
 
-        不再使用 _COORD_SEND_BUTTON 坐标——该坐标在 DPI != 1.0 的会话上系统性偏移，
-        是 §FIX-false-pass 假阴性故障的根因。保留 _COORD_SEND_BUTTON 常量仅供后备。
+        默认走回车（多数聊天 UI 回车即发送，且无坐标依赖）。若标定文件指定
+        submit_method="click"，则点击标定的发送按钮坐标。
         """
-        self.session.computer.press_keys(["Enter"])
+        if self._submit_method == "click" and self._coord_send_button is not None:
+            x, y = self._coord_send_button
+            self.session.computer.click_mouse(x, y)
+        else:
+            self.session.computer.press_keys(["Enter"])
 
     # --- §FIX-verified-steps：确定性环境/状态探测 ---
     # ★ SDK 返回对象的 str() 是 repr（如 <DirectoryEntry object at 0x...>），不含内容；
@@ -193,30 +292,28 @@ class WorkBuddyTarget(Target):
         WorkBuddy 会弹全屏案例推荐，Esc 关不掉，必须点它自己的两个关闭按钮。
         弹窗有两层：先点右侧面板的 ✕，再点内层卡片的 ✕。
         点不掉也不报错——后续投递校验会兜住。
-        """
-        # 第一层：右侧面板的 ✕
-        try:
-            x, y = _COORD_POPUP_CLOSE_PANEL
-            self.session.computer.click_mouse(x, y)
-            time.sleep(2.0)
-        except Exception:
-            pass
 
-        # 第二层：内层卡片的 ✕
+        §FIX-calibration-v2：关闭按钮位置按当前屏幕比例换算，不再写死像素。
+        这样换分辨率自动适配，避免「要关弹窗得先有坐标，而坐标正是要校准的」死锁。
+        """
+        info = self._screen_info() or {}
+        w = info.get("width") or 1920
+        h = info.get("height") or 954
         try:
-            x, y = _COORD_POPUP_CLOSE_CARD
-            self.session.computer.click_mouse(x, y)
-            time.sleep(2.0)
-        except Exception:
-            pass
+            w_i, h_i = int(w), int(h)
+        except (TypeError, ValueError):
+            w_i, h_i = 1920, 954
+
+        for rx, ry in _POPUP_CLOSE_RATIOS:
+            try:
+                self.session.computer.click_mouse(int(w_i * rx), int(h_i * ry))
+                time.sleep(1.5)
+            except Exception:
+                pass
 
     def _screen_info(self) -> dict | None:
         """取当前屏幕参数。取不到返回 None。"""
-        try:
-            info = self.session.computer.get_screen_size()
-        except Exception:
-            return None
-        return info if isinstance(info, dict) else None
+        return _get_screen_info(self.session)
 
     def _check_screen_calibration(self) -> None:
         """对比当前会话屏幕参数与 _CALIBRATED_SCREEN，不一致时往 stderr 打告警。
