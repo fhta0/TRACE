@@ -11,8 +11,10 @@ API 来自 §4：command / filesystem / computer 三类。
 """
 from __future__ import annotations
 
+import struct
 import sys
 import time
+import zlib
 from typing import Any
 
 from .target import Target
@@ -84,21 +86,71 @@ def _get_screen_info(session: Any) -> dict | None:
     return None
 
 
-def _screens_differ(a: bytes, b: bytes) -> bool:
-    """粗略判断两张截图是否有实质变化。纯确定性，无三方依赖。
+# 画面稳定判据：解压后 filtered 字节的「变化占比」阈值。
+# 实测（2026-09-19，真机 1920x1060 RGBA）：
+#   同一静止画面连续帧变化占比 ~0.001%–0.003%（转圈/时钟/光标等微动画）
+#   不同回复内容之间 ~4.5%–6.5%
+# 两者相差上千倍，0.5% 阈值可干净区分「画面没动」与「智能体在产出」。
+_DIFF_FRAC_THRESHOLD = 0.005
 
-    PNG 是压缩格式，内容变化会显著改变压缩后长度；再辅以采样字节比对，
-    足以区分'画面基本没动'和'智能体产生了回复'这两种情况。
+
+def _png_filtered_bytes(data: bytes) -> tuple[int, int, bytes]:
+    """把 PNG 解压成「filtered 扫描线字节」（不做 un-filter）。
+
+    只用 stdlib（struct+zlib），不引入三方依赖。返回 (w, h, raw)。
+    """
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG")
+    w = h = 0
+    idat = bytearray()
+    pos = 8
+    n = len(data)
+    while pos + 8 <= n:
+        ln = struct.unpack(">I", data[pos:pos + 4])[0]
+        typ = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + ln]
+        if typ == b"IHDR":
+            w, h = struct.unpack(">II", body[:8])
+        elif typ == b"IDAT":
+            idat += body
+        elif typ == b"IEND":
+            break
+        pos += 12 + ln  # 4 长度 + 4 类型 + ln 数据 + 4 CRC
+    return w, h, zlib.decompress(bytes(idat))
+
+
+def _screens_differ(a: bytes, b: bytes) -> bool:
+    """判断两张截图是否有实质变化。纯确定性，无三方依赖。
+
+    为什么不比压缩后的 PNG 字节（历史教训，别改回去）：
+        PNG 压缩后，任何一个像素变化都会波及整个字节流，采样比对几乎必然判「变」——
+        导致带微动画（转圈/时钟/光标）的界面永远「不稳定」，所有用例误判 TIMEOUT。
+    正解：比 zlib 解压后的 filtered 扫描线字节。像素变化在此是**局部的**，
+        不同字节占比 ∝ 变化区域大小；微动画占比极小，流式回复占比大，阈值可分。
     """
     if not a or not b:
         return True                      # 取不到就不阻断，交给上层
-    size_delta = abs(len(a) - len(b)) / max(len(a), len(b))
-    if size_delta > 0.02:                # 长度差 >2% 认为有实质变化
+    try:
+        wa, ha, ra = _png_filtered_bytes(a)
+        wb, hb, rb = _png_filtered_bytes(b)
+    except Exception:
+        return True                      # 解码失败不阻断，保守视为「有变化」
+    if (wa, ha) != (wb, hb) or len(ra) != len(rb):
         return True
-    # 长度接近时，采样比对若干字节
-    step = max(1, min(len(a), len(b)) // 512)
-    diff = sum(1 for i in range(0, min(len(a), len(b)), step) if a[i] != b[i])
-    return diff > 8
+    total = len(ra)
+    if total == 0:
+        return True
+    limit = total * _DIFF_FRAC_THRESHOLD  # 超过即判「有变化」，可提前退出
+    mva, mvb = memoryview(ra), memoryview(rb)
+    block = 4096
+    changed = 0
+    for i in range(0, total, block):
+        ba, bb = mva[i:i + block], mvb[i:i + block]
+        if ba != bb:                     # C 级块比较，绝大多数块相同 → 快
+            changed += sum(1 for j in range(len(ba)) if ba[j] != bb[j])
+            if changed > limit:
+                return True
+    return False
 
 
 class WorkBuddyTarget(Target):
