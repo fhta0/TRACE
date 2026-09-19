@@ -6,6 +6,18 @@
     首次实际使用时再验证。
 
 provision 是一次性步骤，不进测量环（run_case 不调用 install()）。
+
+下载看门狗（2026-09-18 修正）：
+  curl 的超时参数（-m / --speed-limit / --speed-time / --retry）在这个环境的卡死状态下
+  **全部无效**。真机实测：-m 300 在卡死 42 分钟里没开火，socket 读操作被楔死，
+  没有回到 curl 的事件循环，计时器根本没机会被求值。
+
+  **教训：验证一个修复，必须在它要修的那个故障状态下验证，而不是在正常状态下验证。**
+  前两次分别加了 --speed-limit/--speed-time/--retry 和 -m 300，都以为解决了，
+  但只在健康网络下测试，完全没有证明它们在卡死时会生效。
+
+  已验证有效的解法：Python 侧外部看门狗盯文件大小增长，卡死就杀 curl 用 -C - 续传重启，
+  完成判据是文件大小 == Content-Length（确定性信号，不信 curl 退出码）。
 """
 from __future__ import annotations
 
@@ -41,6 +53,11 @@ _EXT_BY_TYPE: dict[str, str | None] = {
 _POLL_INTERVAL_S = 20
 _DEFAULT_TIMEOUT_S = 1800  # 30 分钟（curl 已带 stall 检测/重试，这里再给极慢但仍在下载的网络留余量）
 
+# --- 下载看门狗参数（2026-09-18 修正：不信 curl 超时，只信文件大小增长） ---
+_STALL_S = 90        # 连续 90 秒无增长即判定卡死
+_POLL_S = 15         # 每 15 秒检查一次文件大小
+_DEADLINE_S = 3000   # 总时限 50 分钟（给极慢网络留余量）
+
 
 # ---------------------------------------------------------------------------
 # spec 校验
@@ -68,6 +85,82 @@ def _validate_spec(spec: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 下载看门狗辅助函数（2026-09-18 修正：不信 curl 超时，只信文件大小增长）
+# ---------------------------------------------------------------------------
+def _get_content_length(session: Any, url: str) -> int:
+    """通过 HEAD 请求获取 Content-Length。取不到抛 RuntimeError。"""
+    cmd = (
+        f'powershell -NoProfile -Command "'
+        f"(curl.exe -sIL '{url}' | Select-String -Pattern '^Content-Length' | "
+        f'Select-Object -Last 1).ToString()"'
+    )
+    try:
+        out = session.command.execute_command(cmd, timeout_ms=90000)
+        hdr = (getattr(out, "output", "") or "").strip()
+    except Exception as e:
+        raise RuntimeError(f"获取 Content-Length 失败：{e}")
+
+    # 解析最后一个数字 token
+    total = 0
+    for tok in hdr.replace(":", " ").split():
+        if tok.isdigit():
+            total = max(total, int(tok))
+
+    if total <= 0:
+        raise RuntimeError(
+            f"无法获取 Content-Length（响应：{hdr!r}）。"
+            f"没有完成判据就不要开始下载，否则又回到'猜'。"
+        )
+    return total
+
+
+def _get_file_size(session: Any, path: str) -> int:
+    """获取会话内文件大小（字节）。文件不存在返回 0，出错返回 -1。"""
+    cmd = (
+        f'powershell -NoProfile -Command "'
+        f"if (Test-Path '{path}') {{ (Get-Item '{path}').Length }} else {{ 0 }}"
+        f'"'
+    )
+    try:
+        out = session.command.execute_command(cmd, timeout_ms=30000)
+        return int((getattr(out, "output", "") or "").strip().split()[-1])
+    except Exception:
+        return -1
+
+
+def _count_curl_processes(session: Any) -> int:
+    """统计会话内 curl 进程数。出错返回 -1。"""
+    cmd = (
+        'powershell -NoProfile -Command '
+        '"(Get-Process curl -ErrorAction SilentlyContinue | Measure-Object).Count"'
+    )
+    try:
+        out = session.command.execute_command(cmd, timeout_ms=30000)
+        return int((getattr(out, "output", "") or "").strip().split()[-1])
+    except Exception:
+        return -1
+
+
+def _kill_curl(session: Any) -> None:
+    """杀掉会话内所有 curl 进程。"""
+    cmd = (
+        'powershell -NoProfile -Command '
+        '"Stop-Process -Name curl -Force -ErrorAction SilentlyContinue"'
+    )
+    try:
+        session.command.execute_command(cmd, timeout_ms=30000)
+    except Exception:
+        pass  # 杀失败不算致命，下一轮会重试
+
+
+def _start_download(session: Any, tmp_path: str, url: str) -> None:
+    """后台启动 curl 下载（-C - 续传，--connect-timeout 20）。"""
+    cmd = f'start "" /B curl -L -C - --connect-timeout 20 -o "{tmp_path}" "{url}"'
+    # start /B 的 success=False 是常态，不判成败
+    session.command.execute_command(cmd, timeout_ms=30000)
+
+
+# ---------------------------------------------------------------------------
 # bat 内容构造
 # ---------------------------------------------------------------------------
 def _tmp_path_for(spec: dict) -> str:
@@ -79,7 +172,15 @@ def _tmp_path_for(spec: dict) -> str:
 
 
 def _build_bat_body(spec: dict, tmp_path: str) -> str:
-    """按 installer_type 拼接 bat 命令主体（清旧 flag + 下载 + 安装 + 打新 flag）。"""
+    """按 installer_type 拼接 bat 命令主体。
+
+    Args:
+        spec: 安装规格
+        tmp_path: 临时安装包路径
+
+    bat 只做：清旧 flag + 安装 + 打新 flag。
+    下载由 Python 侧看门狗驱动（2026-09-18 修正）。
+    """
     itype = spec["installer_type"]
     silent_args = spec.get("silent_args") or _DEFAULT_SILENT.get(itype)
     url = spec.get("url")
@@ -94,28 +195,6 @@ def _build_bat_body(spec: dict, tmp_path: str) -> str:
         effective = silent_args or _DEFAULT_SILENT["winget"]
         lines.append(f'winget install --id {spec["winget_id"]} {effective}')
     else:
-        # 1.5) 清理可能损坏的旧文件（避免 -C - 续传导致问题）
-        lines.append(f'if exist "{tmp_path}" del /f /q "{tmp_path}"')
-
-        # 2) 下载（带 stall 检测/重试，移除 -C - 避免损坏文件续传）
-        #    --connect-timeout 30          ：30 秒连不上就失败（触发重试）
-        #    --speed-limit 10000           ：
-        #    --speed-time 30               ：下载速度低于 10KB/s 持续 30 秒即判 stall、中断
-        #    --retry 5 --retry-delay 5     ：失败最多重试 5 次，每次隔 5 秒
-        #    --retry-all-errors            ：所有错误都重试（不只是瞬态）
-        #    -m 300                        ：硬上限 5 分钟，兜住 post-connect stall。
-        #                                    实测：curl 曾在建连后 0 bytes 卡死 30 分钟，
-        #                                    --speed-limit/--retry 在该状态下不触发
-        #                                    （无数据流，speed-time 无从计时）；
-        #                                    而 CDN 本身健康（同文件 441MB/40s）。
-        #                                    加 -m 后同一安装 30 秒完成。
-        lines.append(
-            f'curl -L --retry 5 --retry-delay 5 --retry-all-errors '
-            f'--connect-timeout 30 --speed-limit 10000 --speed-time 30 '
-            f'-m 300 '
-            f'-o "{tmp_path}" "{url}"'
-        )
-        # 3) 安装（按类型分支）
         if itype in ("nsis", "inno"):
             lines.append(f'"{tmp_path}" {silent_args}')
         elif itype == "msi":
@@ -233,20 +312,25 @@ def install(
       - ``ready_path``:     判定"装好了"的文件绝对路径（str 或 list[str]，任一存在即算就绪）
       - ``launch_cmd``:     可选，安装后启动 agent 的命令
 
-    流程：
-      0. 清理残留进程和损坏文件（避免锁文件）
-      1. 写一个 .bat 到会话（首行清旧 flag，中间 curl+静默安装，末尾打新 flag）。
-      2. 后台启动该 bat（PowerShell Start-Process）。
-      3. Python 侧每 ``poll_interval_s`` 秒轮询 flag 是否出现，最多 ``timeout_s`` 秒。
-      4. flag 出现后，再用 ``ready_path`` 二次确认目标文件存在。
-      5. 若给了 ``launch_cmd``，启动它。
+    流程（2026-09-18 修正）：
+      0. 清理残留进程和损坏文件
+      1. winget 类型：直接写 bat（安装 + 打 flag），后台启动，轮询 flag
+      2. 其他类型：
+         a. 取 Content-Length（取不到抛异常，没有完成判据就不开始）
+         b. Python 侧看门狗驱动下载：监控文件大小，卡死就杀 curl 用 -C - 续传
+         c. 下载完成判据：文件大小 == Content-Length（不信 curl 退出码）
+         d. 写安装 bat（清 flag + 安装 + 打 flag），后台启动，轮询 flag
+      3. flag 出现后，用 ready_path 二次确认
+      4. 若给了 launch_cmd，启动它
 
     验证状态：
       - nsis 路径已由协调方在 WorkBuddy 上实测。
       - inno / msi / zip / winget 走标准安装器模式，首次实际使用时再验证。
 
-    失败/超时抛 ``RuntimeError``，消息含 flag 状态与 ready_path 检查结果。
+    失败/超时抛 ``RuntimeError``，消息含详细诊断信息。
     """
+    import sys
+
     _validate_spec(spec)
 
     tmp_path = _tmp_path_for(spec)
@@ -254,15 +338,129 @@ def install(
     # 0) 预清理：终止残留进程 + 删除损坏文件
     _pre_cleanup(session, tmp_path)
 
+    if spec["installer_type"] == "winget":
+        # winget 无下载步，直接走 bat 安装流程
+        body = _build_bat_body(spec, tmp_path)
+        _write_bat(session, body, bat_path=_INSTALL_BAT)
+        _start_bat_background(session)
+        _poll_flag_and_ready(session, spec, timeout_s, poll_interval_s)
+        launch_cmd = spec.get("launch_cmd")
+        if launch_cmd:
+            _launch(session, launch_cmd)
+        return None
+
+    # 非 winget 类型：Python 看门狗驱动下载
+    url = spec["url"]
+    print(f"[TRACE] 获取 Content-Length ...", file=sys.stderr, flush=True)
+    total_size = _get_content_length(session, url)
+    print(
+        f"[TRACE] 期望总大小 = {total_size:,} 字节 ({total_size / 1048576:.1f} MB)",
+        file=sys.stderr, flush=True
+    )
+
+    # 删除旧 tmp 文件（避免续传损坏文件）
+    if tmp_path:
+        body = f'if exist "{tmp_path}" del /f /q "{tmp_path}"'
+        _write_bat(session, body, bat_path=_POLL_BAT)
+        try:
+            session.command.execute_command(f'cmd /c "{_POLL_BAT}"', timeout_ms=10000)
+        except Exception:
+            pass
+
+    # 杀残留 curl
+    _kill_curl(session)
+    time.sleep(2)
+
+    # 下载看门狗主循环
+    t_start = time.monotonic()
+    attempt = 0
+    last_size = _get_file_size(session, tmp_path)
+    last_change = time.monotonic()
+    print(f"[TRACE] 断点位置 = {last_size:,} 字节", file=sys.stderr, flush=True)
+
+    while time.monotonic() - t_start < _DEADLINE_S:
+        cur = _get_file_size(session, tmp_path)
+
+        # 完成判据：文件大小 >= Content-Length
+        if cur >= total_size:
+            print(f"[TRACE] 下载完成 {cur:,} 字节", file=sys.stderr, flush=True)
+            break
+
+        # 检查 curl 进程
+        curl_count = _count_curl_processes(session)
+        if curl_count == 0:
+            # curl 不在跑，启动（-C - 续传）
+            attempt += 1
+            print(
+                f"[TRACE] [第 {attempt} 次] 启动 curl（-C - 续传，从 {cur:,} 开始）",
+                file=sys.stderr, flush=True
+            )
+            _start_download(session, tmp_path, url)
+            time.sleep(5)
+            last_change = time.monotonic()
+            last_size = _get_file_size(session, tmp_path)
+            continue
+
+        # 检查文件大小增长
+        if cur > last_size:
+            # 有增长，刷新状态
+            rate = (cur - last_size) / max(time.monotonic() - last_change, 1) / 1024
+            pct = cur * 100.0 / total_size
+            print(
+                f"[TRACE] 下载 {cur:,} / {total_size:,} ({pct:.1f}%)  {rate:.0f} KB/s",
+                file=sys.stderr, flush=True
+            )
+            last_size = cur
+            last_change = time.monotonic()
+        elif time.monotonic() - last_change > _STALL_S:
+            # 卡死：连续 STALL_S 秒无增长
+            print(
+                f"[TRACE] !!! 卡死 {_STALL_S}s（停在 {cur:,}），杀掉 curl 重启续传",
+                file=sys.stderr, flush=True
+            )
+            _kill_curl(session)
+            time.sleep(3)
+            last_change = time.monotonic()
+
+        time.sleep(_POLL_S)
+
+    # 最终校验
+    final_size = _get_file_size(session, tmp_path)
+    if final_size < total_size:
+        elapsed = time.monotonic() - t_start
+        since_last_growth = time.monotonic() - last_change
+        raise RuntimeError(
+            f"下载未完成：实际 {final_size:,} 字节 / 期望 {total_size:,} 字节。"
+            f"已运行 {elapsed:.0f}s，重启 {attempt} 次，"
+            f"最后一次增长在 {since_last_growth:.0f}s 前。"
+            f"建议：换时间重试 / 检查 CDN 可达性。"
+        )
+
+    print(f"[TRACE] 完整性校验通过：{final_size:,} == {total_size:,}", file=sys.stderr, flush=True)
+
+    # 下载完成，写安装 bat 并启动
     body = _build_bat_body(spec, tmp_path)
-
-    # 1) 写安装 bat 到 _INSTALL_BAT（含清旧 flag 行），然后后台启动
     _write_bat(session, body, bat_path=_INSTALL_BAT)
-
-    # 2) 后台启动
     _start_bat_background(session)
 
-    # 3) 轮询 flag
+    # 轮询 flag + ready_path
+    _poll_flag_and_ready(session, spec, timeout_s, poll_interval_s)
+
+    # 启动 launch_cmd（若提供）
+    launch_cmd = spec.get("launch_cmd")
+    if launch_cmd:
+        _launch(session, launch_cmd)
+
+    return None
+
+
+def _poll_flag_and_ready(
+    session: Any,
+    spec: dict,
+    timeout_s: int,
+    poll_interval_s: int,
+) -> None:
+    """轮询 flag 出现，然后二次确认 ready_path。超时或 ready_path 不存在抛 RuntimeError。"""
     deadline = time.monotonic() + timeout_s
     last_flag_state = "PENDING"
     while time.monotonic() < deadline:
@@ -278,20 +476,13 @@ def install(
             f"ready_exists={ready_ok}"
         )
 
-    # 4) 二次确认 ready_path
+    # 二次确认 ready_path
     ready_ok = _check_ready_path(session, spec["ready_path"])
     if not ready_ok:
         raise RuntimeError(
             f"provision flag 已出现但 ready_path 不存在："
             f"{spec['ready_path']}（安装疑似失败）"
         )
-
-    # 5) 启动 launch_cmd（若提供）
-    launch_cmd = spec.get("launch_cmd")
-    if launch_cmd:
-        _launch(session, launch_cmd)
-
-    return None
 
 
 def _pre_cleanup(session: Any, tmp_path: str) -> None:

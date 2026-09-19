@@ -13,3 +13,4 @@ evidence/
 .ds-*.log
 __pycache__/
 *.pyc
+.cli-it/

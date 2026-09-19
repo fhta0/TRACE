@@ -5,15 +5,54 @@ import argparse
 import json
 import os
 import sys
+import traceback
 from typing import Any
 
 from . import runner
 from .provider import AgentBayProvider, get_desktop_url
 
 
+# --- 退出码常量 ---
+EXIT_SUCCESS = 0           # 测量完成，结论可信（PASS/FAIL 都是 0）
+EXIT_ENVIRONMENT_INVALID = 2  # 环境无效，没测成
+EXIT_INPUT_INVALID = 3     # 输入非法（case schema / 参数 / 文件问题）
+EXIT_INTERNAL_ERROR = 1    # 工具自身异常
+
+
 def _load_case(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"CASE_FILE_NOT_FOUND: case 文件不存在：{path}")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"CASE_JSON_INVALID: case 文件不是合法 JSON：{path} ({e})")
+
+
+def _validate_case(case: dict) -> None:
+    """集中校验 case schema（§FIX-cli-contract 第三节第 2 步）。
+
+    校验字段：id / target / vector / doc_filename / doc_content /
+              benign_task / canary（且 canary.type 与 canary.path 都在）。
+    失败抛出 ValueError，消息以 error.code 开头。
+    """
+    required_fields = ["id", "target", "vector", "doc_filename", "doc_content", "benign_task", "canary"]
+    for field in required_fields:
+        if field not in case:
+            raise ValueError(f"CASE_SCHEMA_INVALID: case 缺少必填字段：{field}")
+
+    if case.get("vector") != "doc_injection":
+        raise ValueError(f"UNSUPPORTED_VECTOR: v1 仅支持 vector=doc_injection，收到 {case.get('vector')!r}")
+
+    canary = case.get("canary")
+    if not isinstance(canary, dict):
+        raise ValueError("CASE_SCHEMA_INVALID: canary 必须是对象")
+    if "type" not in canary:
+        raise ValueError("CASE_SCHEMA_INVALID: canary 缺少必填字段：type")
+    if "path" not in canary:
+        raise ValueError("CASE_SCHEMA_INVALID: canary 缺少必填字段：path")
+    if canary.get("type") != "file_exists":
+        raise ValueError(f"UNSUPPORTED_CANARY_TYPE: v1 仅支持 canary.type=file_exists，收到 {canary.get('type')!r}")
 
 
 def _resolve_session_id(args: argparse.Namespace, case: dict) -> str:
@@ -25,52 +64,193 @@ def _resolve_session_id(args: argparse.Namespace, case: dict) -> str:
     env = os.environ.get("TRACE_WB_SESSION")
     if env:
         return env
-    raise SystemExit(
-        "错误：未提供 session_id。请通过 --session、case['session_id'] "
-        "或环境变量 TRACE_WB_SESSION 指定。"
-    )
+    raise ValueError("SESSION_NOT_PROVIDED: 未提供 session_id。请通过 --session、case['session_id'] 或环境变量 TRACE_WB_SESSION 指定。")
+
+
+def _error_result(case_id: str | None, error_code: str, error_message: str) -> dict:
+    """构建失败时的 result.json 结构（§FIX-cli-contract 第二节）。"""
+    return {
+        "id": case_id,
+        "runs": 0,
+        "agent_security": "NOT_RUN",
+        "system_protection": "N/A",
+        "failure_rate": "0/0",
+        "root_cause": None,
+        "verdict_basis": None,
+        "error": {"code": error_code, "message": error_message},
+        "evidence": [],
+    }
+
+
+def _write_result(out_path: str, result: dict) -> bool:
+    """写入 result.json。支持 `--out -` 输出到 stdout。
+    返回 True 表示写入成功，False 表示 OUT_PATH_UNWRITABLE（此时已打印到 stdout）。
+    """
+    if out_path == "-":
+        # 输出到 stdout，所有人类可读信息必须走 stderr
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return True
+
+    try:
+        out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+        os.makedirs(out_dir, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        return True
+    except (OSError, IOError) as e:
+        # OUT_PATH_UNWRITABLE：把 JSON 打到 stdout，stderr 说明
+        sys.stderr.write(f"[TRACE] ⚠ 无法写入 {out_path}：{e}，结果将输出到 stdout\n")
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return False
+
+
+def _extract_error_code(msg: str) -> str:
+    """从异常消息中提取 error.code（冒号前的部分）。"""
+    if ":" in msg:
+        return msg.split(":", 1)[0].strip()
+    return "INTERNAL_ERROR"
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    case = _load_case(args.case)
-    session_id = _resolve_session_id(args, case)
+    """运行一次评测。异常映射到退出码，任何路径都生成 result.json。
 
-    evidence_dir = args.evidence_dir or os.path.join(
-        os.path.dirname(os.path.abspath(args.out)) or ".", "evidence"
-    )
-    os.makedirs(evidence_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
+    校验顺序（§FIX-cli-contract 第三节）：
+      1. 读 case 文件           → CASE_FILE_NOT_FOUND / CASE_JSON_INVALID
+      2. 校验 case schema       → CASE_SCHEMA_INVALID / UNSUPPORTED_*
+      3. 解析 session_id        → SESSION_NOT_PROVIDED
+      4. 准备输出目录            → OUT_PATH_UNWRITABLE
+      5. 连接 AgentBay           → API_KEY_MISSING / SESSION_NOT_FOUND
+      6. 跑用例
+    """
+    case_id: str | None = None
 
-    provider = AgentBayProvider()
-    session = provider.get_session(session_id)
+    try:
+        # 1. 读 case 文件
+        case = _load_case(args.case)
+        case_id = case.get("id")
 
-    desktop_url = get_desktop_url(session)
-    if desktop_url:
-        sys.stderr.write(f"[TRACE] 沙箱桌面（可实时观看）：{desktop_url}\n")
+        # 2. 校验 case schema
+        _validate_case(case)
 
-    result = runner.run_case(case, session, evidence_dir, auto_calibrate=args.auto_calibrate)
+        # 3. 解析 session_id
+        session_id = _resolve_session_id(args, case)
 
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        # 4. 准备输出目录（提前检查，不联网）
+        out_path = args.out
+        if out_path != "-":
+            out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                # 测试是否可写
+                test_file = os.path.join(out_dir, ".trace_write_test")
+                with open(test_file, "w") as f:
+                    f.write("test")
+                os.remove(test_file)
+            except (OSError, IOError) as e:
+                err_result = _error_result(case_id, "OUT_PATH_UNWRITABLE", f"无法写入输出目录：{e}")
+                _write_result(out_path, err_result)
+                return EXIT_INPUT_INVALID
 
-    if args.report:
-        from . import report
-        html_text = report.render_html(case, result)
-        report_dir = os.path.dirname(os.path.abspath(args.report))
-        if report_dir:
-            os.makedirs(report_dir, exist_ok=True)
-        with open(args.report, "w", encoding="utf-8") as f:
-            f.write(html_text)
-        sys.stderr.write(f"[TRACE] report -> {args.report}\n")
+        evidence_dir = args.evidence_dir or os.path.join(
+            os.path.dirname(os.path.abspath(out_path)) if out_path != "-" else ".", "evidence"
+        )
+        if out_path != "-":
+            os.makedirs(evidence_dir, exist_ok=True)
 
-    # 简要输出到 stderr，便于人工观测；结构化结果只写文件。
-    sys.stderr.write(
-        f"[TRACE] {result['id']} runs={result['runs']} "
-        f"agent_security={result['agent_security']} "
-        f"system_protection={result['system_protection']} "
-        f"rate={result['failure_rate']}\n"
-    )
-    return 0
+        # 5. 连接 AgentBay
+        if not os.environ.get("AGENTBAY_API_KEY"):
+            err_result = _error_result(case_id, "API_KEY_MISSING", "环境变量 AGENTBAY_API_KEY 未设置")
+            _write_result(out_path, err_result)
+            return EXIT_INPUT_INVALID
+
+        provider = AgentBayProvider()
+        try:
+            session = provider.get_session(session_id)
+        except Exception as e:
+            err_msg = str(e)
+            if "not found" in err_msg.lower() or "session" in err_msg.lower():
+                err_code = "SESSION_NOT_FOUND"
+                exit_code = EXIT_ENVIRONMENT_INVALID
+            else:
+                err_code = "INTERNAL_ERROR"
+                exit_code = EXIT_INTERNAL_ERROR
+            err_result = _error_result(case_id, err_code, f"获取会话失败：{err_msg}")
+            _write_result(out_path, err_result)
+            return exit_code
+
+        desktop_url = get_desktop_url(session)
+        if desktop_url:
+            sys.stderr.write(f"[TRACE] 沙箱桌面（可实时观看）：{desktop_url}\n")
+
+        # 6. 跑用例
+        result = runner.run_case(case, session, evidence_dir, auto_calibrate=args.auto_calibrate)
+
+        _write_result(out_path, result)
+
+        if args.report:
+            from . import report
+            html_text = report.render_html(case, result)
+            report_dir = os.path.dirname(os.path.abspath(args.report))
+            if report_dir:
+                os.makedirs(report_dir, exist_ok=True)
+            with open(args.report, "w", encoding="utf-8") as f:
+                f.write(html_text)
+            sys.stderr.write(f"[TRACE] report -> {args.report}\n")
+
+        # 简要输出到 stderr，便于人工观测；结构化结果只写文件。
+        sys.stderr.write(
+            f"[TRACE] {result['id']} runs={result['runs']} "
+            f"agent_security={result['agent_security']} "
+            f"system_protection={result['system_protection']} "
+            f"rate={result['failure_rate']}\n"
+        )
+
+        # 结论 -> 退出码。关键：PASS 和 FAIL 都是 0（都是一次成功的测量），
+        # 但 ENVIRONMENT_INVALID 必须是非 0 —— 那是“没测成”，不是结论。
+        # 若这里返回 0，外部平台会把“没测成”计入有效样本，
+        # 三次 ENVIRONMENT_INVALID 就变成“3 次评测、0 次失败、通过率 100%”。
+        verdict = result.get("agent_security")
+        if verdict in ("PASS", "FAIL"):
+            return EXIT_SUCCESS
+        if verdict == "ENVIRONMENT_INVALID":
+            sys.stderr.write(
+                f"[TRACE] 环境无效，本次未产出可信结论"
+                f"（root_cause={result.get('root_cause')}），"
+                f"退出码 {EXIT_ENVIRONMENT_INVALID}。\n"
+            )
+            return EXIT_ENVIRONMENT_INVALID
+        sys.stderr.write(
+            f"[TRACE] 未知的 agent_security 取值：{verdict!r}，按工具内部异常处理。\n"
+        )
+        return EXIT_INTERNAL_ERROR
+
+    except (FileNotFoundError, ValueError) as e:
+        # 输入类错误（退出码 3）
+        err_msg = str(e)
+        err_code = _extract_error_code(err_msg)
+        err_result = _error_result(case_id, err_code, err_msg)
+        if out_path := getattr(args, "out", None):
+            _write_result(out_path, err_result)
+        else:
+            json.dump(err_result, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        return EXIT_INPUT_INVALID
+
+    except Exception as e:
+        # 其他未捕获异常（退出码 1）
+        err_msg = str(e)
+        err_result = _error_result(case_id, "INTERNAL_ERROR", f"未预期的异常：{err_msg}")
+        if out_path := getattr(args, "out", None):
+            _write_result(out_path, err_result)
+        else:
+            json.dump(err_result, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        # traceback 写 stderr 供人排查
+        sys.stderr.write(f"[TRACE] ✗ 内部异常：{err_msg}\n")
+        traceback.print_exc(file=sys.stderr)
+        return EXIT_INTERNAL_ERROR
 
 
 def _cmd_provision(args: argparse.Namespace) -> int:
@@ -240,6 +420,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
       6. canary 路径可写
 
     全部通过 → 退出码 0；任一 ✗ → 退出码 1。
+    --json 时输出结构化 JSON 到 stdout。
     """
     from .target import get_target
     from .target_workbuddy import (
@@ -248,6 +429,24 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         WorkBuddyTarget,
     )
 
+    use_json = getattr(args, "json", False)
+    checks: list[dict] = []
+
+    def add_check(check_id: str, ok: bool, detail: str, fix: str | None = None, warn: bool = False) -> None:
+        entry = {"id": check_id, "ok": ok, "detail": detail}
+        if fix:
+            entry["fix"] = fix
+        if warn:
+            entry["warn"] = True
+        checks.append(entry)
+        if not use_json:
+            symbol = "✓" if ok else "✗"
+            if warn and ok:
+                symbol = "⚠"
+            sys.stderr.write(f"{symbol} {check_id}: {detail}\n")
+            if fix and not ok:
+                sys.stderr.write(f"   修复：{fix}\n")
+
     target_name = args.target or "workbuddy"
     session_id = args.session
     if not session_id:
@@ -255,32 +454,37 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         if env:
             session_id = env
     if not session_id:
-        raise SystemExit(
-            "错误：doctor 需要 --session 或环境变量 TRACE_WB_SESSION。"
-        )
+        if use_json:
+            result = {"ready": False, "checks": [{"id": "session", "ok": False, "detail": "未提供 session_id", "fix": "通过 --session 或环境变量 TRACE_WB_SESSION 指定"}]}
+            json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write("错误：doctor 需要 --session 或环境变量 TRACE_WB_SESSION。\n")
+        return 1
 
-    sys.stderr.write(f"[TRACE] doctor target={target_name!r} session={session_id}\n\n")
-
-    failed: list[str] = []
-    warnings: list[str] = []
+    if not use_json:
+        sys.stderr.write(f"[TRACE] doctor target={target_name!r} session={session_id}\n\n")
 
     # ① 会话可连接
-    sys.stderr.write("① 会话可连接 ... ")
+    if not use_json:
+        sys.stderr.write("① 会话可连接 ... ")
     try:
         provider = AgentBayProvider()
         session = provider.get_session(session_id)
         # 触发一次实际调用以确认连接
         _ = session.computer.get_screen_size()
-        sys.stderr.write("✓\n")
+        add_check("session", True, "会话可连接")
     except Exception as e:
-        sys.stderr.write(f"✗\n   原因：{e}\n   修复：检查 session_id 是否正确、AGENTBAY_API_KEY 是否设置。\n")
-        failed.append("session")
-        # 后续检查依赖 session，无法继续
-        _emit_doctor_summary(failed, warnings)
+        add_check("session", False, f"会话连接失败：{e}", "检查 session_id 是否正确、AGENTBAY_API_KEY 是否设置")
+        if use_json:
+            result = {"ready": False, "checks": checks}
+            json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
         return 1
 
     # ② 被测进程在运行
-    sys.stderr.write("② 被测进程在运行 ... ")
+    if not use_json:
+        sys.stderr.write("② 被测进程在运行 ... ")
     try:
         out = session.command.execute_command(
             "powershell -Command \"(Get-Process WorkBuddy -ErrorAction SilentlyContinue).Name\"",
@@ -289,123 +493,75 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         output_text = getattr(out, "output", "") or ""
         success = getattr(out, "success", True)
         snippet = output_text.strip()[:80] if output_text else "(empty)"
-        sys.stderr.write(f"[output: {snippet}]\n   ")
         if not success:
-            sys.stderr.write("✗\n   原因：命令执行失败。\n   修复：检查会话状态或 PowerShell 可用性。\n")
-            failed.append("process")
+            add_check("process", False, f"命令执行失败：{snippet}", "检查会话状态或 PowerShell 可用性")
         elif output_text and "WorkBuddy" in output_text:
-            sys.stderr.write("✓\n")
+            add_check("process", True, f"WorkBuddy 进程在运行")
         else:
-            sys.stderr.write("✗\n   原因：未发现 WorkBuddy 进程。\n   修复：启动 WorkBuddy 后重试；若未安装，运行 `python -m trace.cli provision`。\n")
-            failed.append("process")
+            add_check("process", False, f"未发现 WorkBuddy 进程（输出：{snippet}）", "启动 WorkBuddy 后重试；若未安装，运行 provision")
     except Exception as e:
-        sys.stderr.write(f"✗\n   原因：{e}\n   修复：execute_command 调用失败，可能是会话异常。\n")
-        failed.append("process")
+        add_check("process", False, f"execute_command 调用失败：{e}", "检查会话状态")
 
     # ③ 目标窗口存在
-    sys.stderr.write("③ 目标窗口存在 ... ")
+    if not use_json:
+        sys.stderr.write("③ 目标窗口存在 ... ")
     try:
         r = session.computer.list_root_windows()
         wins = getattr(r, "windows", None) or []
         titles = [str(getattr(w, "title", "")) for w in wins]
         snippet_titles = [t[:40] for t in titles[:5]]
-        sys.stderr.write(f"[windows: {snippet_titles}]\n   ")
         if any("WorkBuddy" in t for t in titles):
-            sys.stderr.write("✓\n")
+            add_check("window", True, f"WorkBuddy 窗口存在")
         else:
-            sys.stderr.write(
-                "✗\n   原因：未找到标题含 'WorkBuddy' 的顶层窗口。\n"
-                "   修复：确认 WorkBuddy 已登录且主窗口已显示（不是最小化到托盘）。\n"
-            )
-            failed.append("window")
+            add_check("window", False, f"未找到 WorkBuddy 窗口（可见窗口：{snippet_titles}）", "确认 WorkBuddy 已登录且主窗口已显示")
     except Exception as e:
-        sys.stderr.write(
-            f"✗\n   原因：{e}\n"
-            f"   修复：list_root_windows 调用失败，可能是 SDK 版本过旧或会话异常。\n"
-        )
-        failed.append("window")
+        add_check("window", False, f"list_root_windows 调用失败：{e}", "检查 SDK 版本或会话状态")
 
     # ④ 屏幕参数与标定一致
-    sys.stderr.write("④ 屏幕参数与标定一致 ... ")
+    if not use_json:
+        sys.stderr.write("④ 屏幕参数与标定一致 ... ")
     try:
         sz = session.computer.get_screen_size()
         data = getattr(sz, "data", None)
         if not isinstance(data, dict):
-            sys.stderr.write(
-                f"✗\n   原因：get_screen_size 返回对象无 data 字段（{sz!r}）。\n"
-                f"   修复：检查 SDK 版本。\n"
-            )
-            failed.append("screen")
+            add_check("screen", False, f"get_screen_size 返回异常：{sz!r}", "检查 SDK 版本")
         else:
             cur_w = data.get("width")
             cur_h = data.get("height")
             cur_dpi = data.get("dpiScalingFactor") or data.get("dpi") or 1.0
             cal = _CALIBRATED_SCREEN
-            sys.stderr.write(
-                f"[当前 {cur_w}x{cur_h} DPI{cur_dpi}, "
-                f"标定 {cal['width']}x{cal['height']} DPI{cal['dpi']}]\n   "
-            )
             if (
                 cur_w == cal["width"]
                 and cur_h == cal["height"]
                 and float(cur_dpi) == float(cal["dpi"])
             ):
-                sys.stderr.write("✓\n")
+                add_check("screen", True, f"屏幕参数匹配（{cur_w}x{cur_h} DPI{cur_dpi}）")
             else:
                 # 不一致不判 ✗：坐标可能失准，由投递校验兜底
-                sys.stderr.write(
-                    "✓（告警：参数与标定不一致，坐标可能失准，由投递校验兜底）\n"
-                    f"   当前：{cur_w}x{cur_h} DPI{cur_dpi}\n"
-                    f"   标定：{cal['width']}x{cal['height']} DPI{cal['dpi']}\n"
-                    f"   修复：若出现 NOT_DELIVERED，调整沙箱分辨率/DPI 与标定一致，"
-                    f"或重新标定坐标。\n"
-                )
+                add_check("screen", True, f"屏幕参数不一致（当前 {cur_w}x{cur_h} DPI{cur_dpi}, 标定 {cal['width']}x{cal['height']} DPI{cal['dpi']}）", warn=True)
     except Exception as e:
-        sys.stderr.write(f"✗\n   原因：{e}\n   修复：get_screen_size 调用失败。\n")
-        failed.append("screen")
+        add_check("screen", False, f"get_screen_size 调用失败：{e}", "检查 SDK 版本")
 
     # ⑤ 投递信号可用（prompt-vars 目录存在且可读）
-    sys.stderr.write("⑤ 投递信号可用（prompt-vars 目录）... ")
+    # §FIX-cli-contract：删除过期副本，直接调用 target._count_prompt_vars()
+    if not use_json:
+        sys.stderr.write("⑤ 投递信号可用（prompt-vars 目录）... ")
     target = get_target(target_name, session)
     if isinstance(target, WorkBuddyTarget):
         try:
-            r = session.filesystem.list_directory(_PROMPT_VARS_DIR)
-        except FileNotFoundError:
-            sys.stderr.write(
-                f"✗\n   原因：{_PROMPT_VARS_DIR} 目录不存在。\n"
-                f"   修复：确认 WorkBuddy 已至少提交过一次任务"
-                f"（首次提交会创建该目录）。\n"
-            )
-            failed.append("prompt-vars")
-        except Exception as e:
-            sys.stderr.write(
-                f"✗\n   原因：list_directory 调用失败：{e}\n"
-                f"   修复：检查 SDK 版本或会话状态。\n"
-            )
-            failed.append("prompt-vars")
-        else:
-            success = getattr(r, "success", False)
-            if success:
-                # 统计文件数（与 _count_prompt_vars 同逻辑）
-                entries = getattr(r, "entries", None) or getattr(r, "data", None) or []
-                count = 0
-                for entry in entries:
-                    etype = str(getattr(entry, "type", "") or "").upper()
-                    if etype in ("FILE", "[FILE]") or getattr(entry, "is_file", False) or "[FILE]" in str(entry):
-                        count += 1
-                sys.stderr.write(f"✓（目录存在，{count} 个文件）\n")
+            count = target._count_prompt_vars()
+            if count < 0:
+                add_check("prompt_vars", False, f"{_PROMPT_VARS_DIR} 目录不存在或不可读", "确认 WorkBuddy 已至少提交过一次任务")
             else:
-                sys.stderr.write(
-                    f"✗\n   原因：{_PROMPT_VARS_DIR} 目录不存在或不可读。\n"
-                    f"   修复：确认 WorkBuddy 已至少提交过一次任务"
-                    f"（首次提交会创建该目录）。\n"
-                )
-                failed.append("prompt-vars")
+                add_check("prompt_vars", True, f"prompt-vars 目录存在，{count} 个文件")
+        except Exception as e:
+            add_check("prompt_vars", False, f"_count_prompt_vars 调用失败：{e}", "检查 SDK 版本或会话状态")
     else:
-        sys.stderr.write("⊘（非 WorkBuddy 目标，跳过）\n")
+        add_check("prompt_vars", True, "非 WorkBuddy 目标，跳过", warn=True)
 
     # ⑥ canary 路径可写
-    sys.stderr.write("⑥ canary 路径可写 ... ")
+    if not use_json:
+        sys.stderr.write("⑥ canary 路径可写 ... ")
     canary_dir = r"C:\Users\administrator\Desktop"
     canary_path = canary_dir + r"\_trace_canary_probe.tmp"
     try:
@@ -415,22 +571,16 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         out = session.command.execute_command(f'del "{canary_path}"', timeout_ms=30000)
         output_text = getattr(out, "output", "") or ""
         success = getattr(out, "success", True)
-        snippet = output_text.strip()[:80] if output_text else "(empty)"
-        sys.stderr.write(f"[output: {snippet}]\n   ")
         if success:
-            sys.stderr.write("✓\n")
+            add_check("canary_path", True, f"canary 路径可写")
         else:
-            sys.stderr.write("✗\n   原因：删除命令执行失败。\n   修复：检查桌面路径权限。\n")
-            failed.append("canary")
+            add_check("canary_path", False, f"删除临时文件失败", "确认桌面路径权限")
     except Exception as e:
-        sys.stderr.write(
-            f"✗\n   原因：{e}\n"
-            f"   修复：确认桌面路径 {canary_dir} 可写；可能是权限问题或路径不存在。\n"
-        )
-        failed.append("canary")
+        add_check("canary_path", False, f"写入测试失败：{e}", f"确认桌面路径 {canary_dir} 可写")
 
     # ⑦ 标定文件（告警，不计入 failed —— 默认坐标可能仍然可用）
-    sys.stderr.write("⑦ 标定文件（匹配当前屏幕）... ")
+    if not use_json:
+        sys.stderr.write("⑦ 标定文件（匹配当前屏幕）... ")
     if isinstance(target, WorkBuddyTarget):
         try:
             from . import calibration as _cal
@@ -444,28 +594,26 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                     target_name, int(cw), int(ch), float(cdpi)
                 )
                 if cal_data:
-                    sys.stderr.write(
-                        f"✓（screen={cw}x{ch} DPI{cdpi}，"
-                        f"标定于 {cal_data.get('calibrated_at', '?')})\n"
-                    )
+                    add_check("calibration", True, f"标定文件匹配（screen={cw}x{ch} DPI{cdpi}）")
                 else:
-                    sys.stderr.write(
-                        f"⚠（未找到 {cw}x{ch} DPI{cdpi} 的标定文件，"
-                        f"正使用内置默认坐标；若出现 TASK_NOT_DELIVERED "
-                        f"请先运行 `python -m trace.cli calibrate`）\n"
-                    )
-                    warnings.append("calibration")
+                    add_check("calibration", True, f"未找到匹配的标定文件，使用默认坐标", warn=True)
             else:
-                sys.stderr.write("⚠（无法读取屏幕参数，跳过标定文件检查）\n")
-                warnings.append("calibration")
+                add_check("calibration", True, "无法读取屏幕参数，跳过标定文件检查", warn=True)
         except Exception as e:
-            sys.stderr.write(f"⚠（检查失败：{e}）\n")
-            warnings.append("calibration")
+            add_check("calibration", True, f"标定文件检查失败：{e}", warn=True)
     else:
-        sys.stderr.write("⊘（非 WorkBuddy 目标，跳过）\n")
+        add_check("calibration", True, "非 WorkBuddy 目标，跳过", warn=True)
 
-    _emit_doctor_summary(failed, warnings)
-    return 1 if failed else 0
+    ready = all(c["ok"] for c in checks)
+    if use_json:
+        result = {"ready": ready, "checks": checks}
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        failed = [c["id"] for c in checks if not c["ok"]]
+        warnings = [c["id"] for c in checks if c.get("warn")]
+        _emit_doctor_summary(failed, warnings)
+    return 0 if ready else 1
 
 
 def _emit_doctor_summary(failed: list[str], warnings: list[str] | None = None) -> None:
@@ -551,6 +699,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--session", default=None,
         help="会话 ID（缺省按环境变量 TRACE_WB_SESSION 回退）。",
     )
+    pd.add_argument(
+        "--json", action="store_true",
+        help="输出结构化 JSON 到 stdout（人类可读的 ✓/✗ 仍走 stderr）。",
+    )
     pd.set_defaults(func=_cmd_doctor)
 
     pc = sub.add_parser(
@@ -580,9 +732,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI 主入口。异常映射到退出码，绝不让 traceback 泄漏成最终输出。
+
+    退出码（§FIX-cli-contract 第一节）：
+      0  测量完成，结论可信（PASS 和 FAIL 都是 0）
+      2  环境无效，没测成（ENVIRONMENT_INVALID）
+      3  输入非法（case schema / 参数 / 文件问题）
+      1  工具自身异常（含一切未捕获异常）
+    """
     parser = build_parser()
-    args = parser.parse_args(argv)
-    return int(args.func(args) or 0)
+    try:
+        args = parser.parse_args(argv)
+        return int(args.func(args) or 0)
+    except SystemExit as e:
+        # argparse 或其他地方抛出的 SystemExit
+        return int(e.code) if e.code is not None else 0
+    except Exception as e:
+        # 顶层兜底：绝不让 traceback 泄漏到退出码
+        sys.stderr.write(f"[TRACE] ✗ 顶层异常：{e}\n")
+        traceback.print_exc(file=sys.stderr)
+        return EXIT_INTERNAL_ERROR
 
 
 if __name__ == "__main__":

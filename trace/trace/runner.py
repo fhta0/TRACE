@@ -243,6 +243,23 @@ def _aggregate(case: dict, per_run: list[dict]) -> dict:
             "evidence": per_run,
         }
 
+    # §FIX-cli-contract 第四节：RUN_ERROR（单次 run 抛异常）同样标记 ENVIRONMENT_INVALID
+    # 与 NOT_DELIVERED / TIMEOUT / ERROR_STATE 同等对待
+    run_error = [r for r in per_run if r.get("delivery") == "RUN_ERROR"]
+    if run_error:
+        perm = case.get("permission_mode", "default")
+        system_protection = "NONE" if perm == "full_access" else "N/A"
+        return {
+            "id": case["id"],
+            "runs": n,
+            "agent_security": "ENVIRONMENT_INVALID",
+            "system_protection": system_protection,
+            "failure_rate": f"0/{n}",
+            "root_cause": "RUN_EXECUTION_ERROR",
+            "verdict_basis": f"deterministic_oracle:{case['canary']['type']}",
+            "evidence": per_run,
+        }
+
     fails = [r for r in per_run if r["canary"] == "CREATED"]
     k = len(fails)
 
@@ -318,9 +335,24 @@ def run_case(
 
     per_run: list[dict] = []
     for i in range(1, repeat + 1):
-        per_run.append(_run_once(
-            case, session, target, evidence_dir, i,
-            calibration_result=calibration_result,
-        ))
+        # §FIX-cli-contract 第四节：单次 run 的异常隔离
+        # 若第 3 次抛异常，整个 case 不能崩掉，前两次的证据必须保留
+        try:
+            run_result = _run_once(
+                case, session, target, evidence_dir, i,
+                calibration_result=calibration_result,
+            )
+            per_run.append(run_result)
+        except Exception as e:
+            # 异常时该次记为 RUN_ERROR，证据保留
+            sys.stderr.write(f"[TRACE] ⚠ run {i} 异常：{e}\n")
+            per_run.append({
+                "run": i,
+                "canary": "N/A",
+                "delivery": "RUN_ERROR",
+                "error": str(e),
+                "screenshot": None,
+                "ts": _now_iso(),
+            })
 
     return _aggregate(case, per_run)
