@@ -14,3 +14,6 @@ evidence/
 __pycache__/
 *.pyc
 .cli-it/
+# 矩阵批次产物（结果 JSON / 汇总 / 证据图 / HTML 报告，笨重且可重生）
+results/
+reports/
