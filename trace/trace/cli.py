@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import os
 import sys
@@ -1059,6 +1060,452 @@ def _cmd_session_url(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _resolve_cases(cases_arg: str) -> list[str]:
+    """解析 --cases 到 case 文件路径列表。
+
+    - 目录：取其下所有 *.json 文件（排除 _ 开头），按文件名排序。
+    - 逗号分隔列表：直接拆分（保留原始顺序）。
+    目录不存在 / 列表为空时抛 ValueError。
+    """
+    if os.path.isdir(cases_arg):
+        files = sorted(
+            os.path.join(cases_arg, f)
+            for f in os.listdir(cases_arg)
+            if f.endswith(".json") and not f.startswith(("_", "."))
+        )
+        if not files:
+            raise ValueError(f"BATCH_CASES_EMPTY: 目录下没有 *.json 文件：{cases_arg}")
+        return files
+    if os.path.exists(cases_arg):
+        raise ValueError(
+            f"BATCH_CASES_NOT_DIR: --cases 既不是目录也不是文件列表：{cases_arg}"
+        )
+    # 视为逗号分隔路径列表
+    parts = [p.strip() for p in cases_arg.split(",") if p.strip()]
+    if not parts:
+        raise ValueError(f"BATCH_CASES_EMPTY: --cases 解析为空：{cases_arg}")
+    return parts
+
+
+def _format_duration(seconds: float) -> str:
+    """格式化成 Xm Ys（便于进度输出，人读友好）。"""
+    total = max(0, int(seconds))
+    m, s = divmod(total, 60)
+    return f"{m}m{s:02d}s"
+
+
+def _do_health_check(target: Any, target_name: str) -> tuple[bool, str]:
+    """零成本健康检查：窗口还在吗、prompt-vars 目录还读得到吗。
+
+    只查状态，**不提交任务、不消耗额度**。
+    返回 (ok, reason)；非 workbuddy target 直接视为 OK。
+    """
+    from .target_workbuddy import WorkBuddyTarget
+
+    if not isinstance(target, WorkBuddyTarget):
+        return True, "non-WorkBuddy target; skip"
+
+    try:
+        r = target.session.computer.list_root_windows()
+        wins = getattr(r, "windows", None) or []
+        titles = [str(getattr(w, "title", "")) for w in wins]
+        if not any("WorkBuddy" in t for t in titles):
+            return False, f"WorkBuddy 窗口不存在（可见：{titles[:5]}）"
+    except Exception as e:
+        return False, f"list_root_windows 失败：{e}"
+
+    try:
+        n = target._count_prompt_vars()
+    except Exception as e:
+        return False, f"_count_prompt_vars 异常：{e}"
+    if n < 0:
+        return False, "prompt-vars 目录不可读"
+    return True, f"window OK, prompt-vars={n}"
+
+
+def _summarize_case(case: dict, result: dict, result_path: str) -> dict:
+    """构造单条 case 的批次汇总条目（字段名对齐 §FEAT-run-batch 示例）。"""
+    return {
+        "id": case["id"],
+        "agent_security": result.get("agent_security"),
+        "root_cause": result.get("root_cause"),
+        "failure_rate": result.get("failure_rate"),
+        "result_path": result_path,
+    }
+
+
+# --- §FEAT-run-batch：批次运行（一次校准，连跑整个用例矩阵）---
+_MAX_RECALIBRATIONS_PER_BATCH = 3
+_CONSECUTIVE_ERROR_STATE_ABORT = 2
+
+
+def _cmd_run_batch(args: argparse.Namespace) -> int:
+    """批次运行：一次校准，连跑整个用例矩阵。
+
+    关键约束（§FEAT-run-batch）：
+      - 校准只做一次；布局跳变时允许重新校准（整批最多 3 次）
+      - 额度耗尽（连续 2 个 ERROR_STATE）早停
+      - 单个用例失败不中断批次
+      - 汇总里 ENVIRONMENT_INVALID 不计入通过率分母
+      - 汇总只给原始计数，不给百分比
+      - schema 校验在批次开始前全部完成
+      - 批次层绝不引入新判定规则——单个用例判定完全复用 run_case
+    """
+    batch_start = time.monotonic()
+    batch_id = _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+    # 1. 解析 --cases（目录不存在 / 列表为空 → 退出 3）
+    try:
+        case_paths = _resolve_cases(args.cases)
+    except ValueError as e:
+        sys.stderr.write(f"[TRACE] ✗ {e}\n")
+        return EXIT_INPUT_INVALID
+
+    # 2. 批次开跑前一次性校验所有 case 的 schema（不能跑到第 37 个才发现第 38 个格式不对）
+    cases: list[tuple[str, dict]] = []
+    schema_errors: list[str] = []
+    for path in case_paths:
+        try:
+            case = _load_case(path)
+            _validate_case(case)
+            cases.append((path, case))
+        except (FileNotFoundError, ValueError) as e:
+            schema_errors.append(f"{path}: {e}")
+        except Exception as e:
+            schema_errors.append(f"{path}: 未预期错误：{e}")
+
+    if schema_errors:
+        sys.stderr.write(
+            f"[TRACE] ✗ {len(schema_errors)} 个 case schema 不合法，中止批次：\n"
+        )
+        for err in schema_errors:
+            sys.stderr.write(f"        {err}\n")
+        return EXIT_INPUT_INVALID
+
+    # 3. 解析 session_id
+    try:
+        session_id = _resolve_session_id(args, cases[0][1])
+    except ValueError as e:
+        sys.stderr.write(f"[TRACE] ✗ {e}\n")
+        return EXIT_INPUT_INVALID
+
+    # 4. 准备输出目录
+    out_dir = os.path.abspath(args.out_dir)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        evidence_dir = os.path.join(out_dir, "evidence")
+        os.makedirs(evidence_dir, exist_ok=True)
+    except OSError as e:
+        sys.stderr.write(f"[TRACE] ✗ 无法创建输出目录：{e}\n")
+        return EXIT_INPUT_INVALID
+
+    # 5. 连接 session
+    if not os.environ.get("AGENTBAY_API_KEY"):
+        sys.stderr.write("[TRACE] ✗ API_KEY_MISSING: 环境变量 AGENTBAY_API_KEY 未设置\n")
+        return EXIT_INPUT_INVALID
+
+    provider = AgentBayProvider()
+    try:
+        session = provider.get_session(session_id)
+    except Exception as e:
+        err_msg = str(e)
+        if "not found" in err_msg.lower() or "session" in err_msg.lower():
+            sys.stderr.write(f"[TRACE] ✗ SESSION_NOT_FOUND: {err_msg}\n")
+            return EXIT_ENVIRONMENT_INVALID
+        sys.stderr.write(f"[TRACE] ✗ 获取会话失败：{err_msg}\n")
+        return EXIT_INTERNAL_ERROR
+
+    desktop_url = get_desktop_url(session)
+    if desktop_url:
+        sys.stderr.write(f"[TRACE] 沙箱桌面（可实时观看）：{desktop_url}\n")
+
+    # 6. 批次开始时校准一次（复用给所有用例）
+    total_cases = len(cases)
+    sys.stderr.write(
+        f"[TRACE] 批次开始：{total_cases} 个用例，session={session_id}\n"
+    )
+
+    first_target_name = cases[0][1]["target"]
+    from .target import get_target
+    shared_target = get_target(first_target_name, session)
+
+    sys.stderr.write(
+        f"[TRACE] auto-calibrate: 开始批次初始校准（target={first_target_name}）\n"
+    )
+    calibration_result = runner._auto_calibrate_for_run(shared_target, first_target_name)
+    if calibration_result is None:
+        sys.stderr.write("[TRACE] ✗ 批次初始校准失败，无法继续\n")
+        return EXIT_ENVIRONMENT_INVALID
+
+    coords_source = calibration_result.get("coords_source") or "default"
+    recalibrations = 0
+
+    # 7. 批次状态追踪
+    summary_cases: list[dict] = []
+    verdict_counts: dict[str, int] = {}
+    env_invalid_count = 0
+    measured_count = 0
+    consecutive_error_state = 0
+    aborted = False
+    abort_reason: str | None = None
+
+    # 8. 主循环：逐用例运行
+    for idx, (case_path, case) in enumerate(cases, start=1):
+        case_id = case["id"]
+        case_start = time.monotonic()
+        elapsed_total = time.monotonic() - batch_start
+
+        sys.stderr.write(
+            f"[TRACE] [{idx}/{total_cases}] {case_id} 开始"
+            f"（已用时 {_format_duration(elapsed_total)}）\n"
+        )
+        sys.stderr.flush()
+
+        case_result_path = os.path.join(out_dir, f"{case_id}.json")
+
+        # --repeat 覆盖 case 内的 repeat 字段
+        effective_case = case
+        if args.repeat is not None:
+            effective_case = dict(case)
+            effective_case["repeat"] = args.repeat
+
+        # 复用现有 run_case（不引入任何新判定规则）
+        try:
+            result = runner.run_case(
+                effective_case, session, evidence_dir,
+                auto_calibrate=False,
+                target=shared_target,
+            )
+        except Exception as e:
+            # 单个用例抛异常 → 该用例记 ENVIRONMENT_INVALID / RUN_EXECUTION_ERROR
+            sys.stderr.write(f"[TRACE] ⚠ {case_id} 异常：{e}\n")
+            result = {
+                "id": case_id,
+                "runs": 0,
+                "agent_security": "ENVIRONMENT_INVALID",
+                "system_protection": "N/A",
+                "failure_rate": "0/0",
+                "root_cause": "RUN_EXECUTION_ERROR",
+                "verdict_basis": None,
+                "error": {"code": "RUN_EXECUTION_ERROR", "message": str(e)},
+                "evidence": [],
+            }
+
+        # 任务未送达 → 立刻重新校准一次，然后重跑该用例一次
+        # 重跑仍失败 → 该用例记 ENVIRONMENT_INVALID / TASK_NOT_DELIVERED，继续下一个
+        if (result.get("agent_security") == "ENVIRONMENT_INVALID"
+                and result.get("root_cause") == "TASK_NOT_DELIVERED"):
+            if recalibrations < _MAX_RECALIBRATIONS_PER_BATCH:
+                sys.stderr.write(
+                    f"[TRACE] ⚠ {case_id} 任务未送达，立刻重新校准"
+                    f"（第 {recalibrations + 1}/{_MAX_RECALIBRATIONS_PER_BATCH} 次）...\n"
+                )
+                recalibrations += 1
+                retry_cal = runner._auto_calibrate_for_run(
+                    shared_target, first_target_name
+                )
+                if retry_cal is None:
+                    sys.stderr.write(
+                        f"[TRACE] ✗ {case_id} 重新校准失败，保留 ENVIRONMENT_INVALID 结论\n"
+                    )
+                else:
+                    calibration_result = retry_cal
+                    coords_source = retry_cal.get("coords_source") or coords_source
+                    try:
+                        result = runner.run_case(
+                            effective_case, session, evidence_dir,
+                            auto_calibrate=False,
+                            target=shared_target,
+                        )
+                    except Exception as e:
+                        sys.stderr.write(f"[TRACE] ⚠ {case_id} 重跑异常：{e}\n")
+                        result = {
+                            "id": case_id,
+                            "runs": 0,
+                            "agent_security": "ENVIRONMENT_INVALID",
+                            "system_protection": "N/A",
+                            "failure_rate": "0/0",
+                            "root_cause": "RUN_EXECUTION_ERROR",
+                            "verdict_basis": None,
+                            "error": {"code": "RUN_EXECUTION_ERROR", "message": str(e)},
+                            "evidence": [],
+                        }
+            else:
+                # 用尽重新校准次数 → 中止整批（环境已不可靠，继续跑只是烧钱）
+                _write_result(case_result_path, result)
+                case_elapsed = time.monotonic() - case_start
+                verdict = result.get("agent_security")
+                sys.stderr.write(
+                    f"[TRACE] [{idx}/{total_cases}] {case_id} -> {verdict} "
+                    f"({result.get('failure_rate')}) 用时 {_format_duration(case_elapsed)}\n"
+                )
+                summary_cases.append(_summarize_case(case, result, case_result_path))
+                if verdict in ("PASS", "FAIL"):
+                    verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+                    measured_count += 1
+                else:
+                    env_invalid_count += 1
+                aborted = True
+                abort_reason = "MAX_RECALIBRATIONS_EXCEEDED"
+                sys.stderr.write(
+                    f"[TRACE] ✗ 整批重新校准次数已达上限，中止批次"
+                    f"（已完成 {len(summary_cases)}/{total_cases}）\n"
+                )
+                break
+
+        # 写入该用例的 result.json
+        _write_result(case_result_path, result)
+
+        # 进度输出（每个用例结束都打一行）
+        case_elapsed = time.monotonic() - case_start
+        verdict = result.get("agent_security")
+        sys.stderr.write(
+            f"[TRACE] [{idx}/{total_cases}] {case_id} -> {verdict} "
+            f"({result.get('failure_rate')}) 用时 {_format_duration(case_elapsed)}\n"
+        )
+        sys.stderr.flush()
+
+        # 分类统计（ENVIRONMENT_INVALID 不计入 measured / 通过率分母）
+        summary_cases.append(_summarize_case(case, result, case_result_path))
+        if verdict in ("PASS", "FAIL"):
+            verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+            measured_count += 1
+            consecutive_error_state = 0
+        elif verdict == "ENVIRONMENT_INVALID":
+            env_invalid_count += 1
+            # 连续 2 个 ERROR_STATE → 中止整批（额度可能耗尽）
+            if result.get("root_cause") == "TARGET_AGENT_ERROR":
+                consecutive_error_state += 1
+                if consecutive_error_state >= _CONSECUTIVE_ERROR_STATE_ABORT:
+                    sys.stderr.write(
+                        f"[TRACE] ✗ 连续 {_CONSECUTIVE_ERROR_STATE_ABORT} 个用例 "
+                        f"ERROR_STATE（额度可能耗尽），中止批次"
+                        f"（已完成 {len(summary_cases)}/{total_cases}）\n"
+                    )
+                    aborted = True
+                    abort_reason = "CONSECUTIVE_ERROR_STATE"
+                    break
+            else:
+                consecutive_error_state = 0
+        else:
+            # 未知 agent_security 取值 → 保守计为环境无效
+            env_invalid_count += 1
+            consecutive_error_state = 0
+
+        # 用例跑完做一次零成本健康检查（不提交任务）
+        # 失败时不立刻中止——下一用例开跑前会重新校准
+        health_ok, health_reason = _do_health_check(shared_target, first_target_name)
+        if not health_ok:
+            sys.stderr.write(
+                f"[TRACE] ⚠ {case_id} 跑完后健康检查失败：{health_reason}\n"
+            )
+            if recalibrations < _MAX_RECALIBRATIONS_PER_BATCH:
+                sys.stderr.write(
+                    f"[TRACE] 尝试重新校准以恢复投递能力...\n"
+                )
+                recalibrations += 1
+                retry_cal = runner._auto_calibrate_for_run(
+                    shared_target, first_target_name
+                )
+                if retry_cal is None:
+                    sys.stderr.write(
+                        f"[TRACE] ✗ 重新校准失败，环境可能已不可靠，中止批次\n"
+                    )
+                    aborted = True
+                    abort_reason = "HEALTH_CHECK_FAILED_AND_RECALIBRATE_FAILED"
+                    break
+                calibration_result = retry_cal
+                coords_source = retry_cal.get("coords_source") or coords_source
+            else:
+                sys.stderr.write(
+                    f"[TRACE] ✗ 已用尽重新校准次数，中止批次\n"
+                )
+                aborted = True
+                abort_reason = "MAX_RECALIBRATIONS_EXCEEDED"
+                break
+
+        # 可选：每个用例生成一份 HTML 报告
+        if args.report_dir:
+            try:
+                from . import report as _report
+                os.makedirs(args.report_dir, exist_ok=True)
+                html_text = _report.render_html(case, result)
+                html_path = os.path.join(args.report_dir, f"{case_id}.html")
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(html_text)
+            except Exception as e:
+                sys.stderr.write(
+                    f"[TRACE] ⚠ {case_id} HTML 报告生成失败：{e}\n"
+                )
+
+    # 9. 写批次汇总（即使中途被中止也要把已完成的保留）
+    # 没跑的用例清单：已完成 len(summary_cases) 个，剩余就是没跑的。
+    # 这是『让没测到消失在一个数字里』的批次层版本——必须有字段记录，
+    # 否则上游平台按 `cases` 算覆盖率会以为全部跑过了。
+    not_run_case_ids = [c[1]["id"] for c in cases[len(summary_cases):]]
+    not_run_count = len(not_run_case_ids)
+    # 写入前断言：账目必须对得上。
+    # cases == measured + environment_invalid + not_run
+    # 不成立意味着有用例既没跑也没被记录——严重错误，必须立刻暴露，
+    # 绝不能静默产出一份账对不上的汇总。
+    if total_cases != measured_count + env_invalid_count + not_run_count:
+        raise RuntimeError(
+            f"BATCH_ACCOUNTING_BROKEN: cases({total_cases}) != "
+            f"measured({measured_count}) + environment_invalid({env_invalid_count}) + "
+            f"not_run({not_run_count})"
+        )
+
+    summary = {
+        "batch_id": batch_id,
+        "session_id": session_id,
+        "calibration": {
+            "coords_source": coords_source,
+            "recalibrations": recalibrations,
+        },
+        "totals": {
+            "cases": total_cases,
+            "measured": measured_count,
+            "environment_invalid": env_invalid_count,
+            "not_run": not_run_count,
+        },
+        "not_run_case_ids": not_run_case_ids,
+        "verdicts": verdict_counts,
+        "aborted": aborted,
+        "abort_reason": abort_reason,
+        "cases": summary_cases,
+    }
+
+    summary_path = os.path.join(out_dir, "_batch_summary.json")
+    try:
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        sys.stderr.write(f"[TRACE] 批次汇总 -> {summary_path}\n")
+    except OSError as e:
+        sys.stderr.write(f"[TRACE] ⚠ 无法写入批次汇总：{e}\n")
+
+    if args.json:
+        json.dump(summary, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+
+    total_elapsed = time.monotonic() - batch_start
+    sys.stderr.write(
+        f"[TRACE] 批次结束：measured={measured_count} "
+        f"environment_invalid={env_invalid_count} "
+        f"not_run={not_run_count} "
+        f"verdicts={verdict_counts} "
+        f"aborted={aborted}"
+        f"{(' (' + abort_reason + ')') if aborted else ''} "
+        f"总用时 {_format_duration(total_elapsed)}\n"
+    )
+
+    # 10. 退出码：整批最严重的那个
+    if aborted:
+        return EXIT_ENVIRONMENT_INVALID
+    if env_invalid_count > 0:
+        return EXIT_ENVIRONMENT_INVALID
+    return EXIT_SUCCESS
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="trace", description="TRACE v1 CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1087,6 +1534,44 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     pr.set_defaults(func=_cmd_run)
+
+    # ---- §FEAT-run-batch：批次运行（一次校准，连跑整个用例矩阵）----
+    prb = sub.add_parser(
+        "run-batch",
+        help=(
+            "批次运行：一次校准连跑整个用例矩阵，把校准次数从 N 降到 1"
+            "（校准会提交探针任务消耗真实额度）。"
+            "单个用例判定完全复用 run_case，批次层不引入新判定规则。"
+        ),
+    )
+    prb.add_argument(
+        "--cases", required=True,
+        help=(
+            "用例来源：目录（取其下所有 *.json），或逗号分隔的文件列表。"
+            "schema 校验在批次开跑前一次性完成。"
+        ),
+    )
+    prb.add_argument(
+        "--out-dir", required=True,
+        help="输出目录：每个用例一份 <case-id>.json，以及 _batch_summary.json。",
+    )
+    prb.add_argument(
+        "--session", default=None,
+        help="会话 ID（优先级最高；缺省按首个 case['session_id'] → 环境变量 TRACE_WB_SESSION 回退）。",
+    )
+    prb.add_argument(
+        "--repeat", type=int, default=None,
+        help="覆盖各 case 里的 repeat 字段（缺省沿用 case 内的 repeat）。",
+    )
+    prb.add_argument(
+        "--report-dir", default=None,
+        help="可选，每个用例一份 HTML 报告，输出到该目录。",
+    )
+    prb.add_argument(
+        "--json", action="store_true",
+        help="把批次汇总结果输出到 stdout（人类可读进度仍走 stderr）。",
+    )
+    prb.set_defaults(func=_cmd_run_batch)
 
     pp = sub.add_parser(
         "provision",

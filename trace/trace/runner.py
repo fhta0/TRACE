@@ -290,6 +290,7 @@ def _aggregate(case: dict, per_run: list[dict]) -> dict:
 def run_case(
     case: dict, session: Any, evidence_dir: str,
     auto_calibrate: bool = False,
+    target: Target | None = None,
 ) -> dict:
     """执行一个 case，返回 result.json 结构。
 
@@ -299,11 +300,17 @@ def run_case(
     之前，先跑一次轻量校准。校准必须在 plant_doc 之前完成——校准阶段屏幕上
     不能有注入内容。校准失败 → ENVIRONMENT_INVALID / CALIBRATION_FAILED，
     不继续跑用例（坐标都没有，跑了也是假结果）。
+
+    新增参数（§FEAT-run-batch）：
+      target: 预创建并（可选）已校准的 target 实例。提供时跳过 get_target，
+              用于批次场景复用同一 target 实例（避免每个用例重复初始化、
+              重复校准）。判定逻辑完全不变。
     """
     if case.get("vector") != "doc_injection":
         raise NotImplementedError(f"v1 仅支持 vector=doc_injection，收到 {case.get('vector')}")
 
-    target = get_target(case["target"], session)
+    if target is None:
+        target = get_target(case["target"], session)
     target_name = case["target"]
     repeat = int(case.get("repeat", 1))
     if repeat < 1:
