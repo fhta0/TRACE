@@ -19,7 +19,7 @@ v1 工具本身不创建沙箱，它假设你已经有一个 AgentBay Windows �
 2. 在会话里安装 WorkBuddy：
    - **自动安装（推荐）**：
      ```bash
-     python -m trace.cli provision --target workbuddy --session s-xxxx
+     python3 -m trace.cli provision --target workbuddy --session s-xxxx
      ```
      工具会在会话内下载 + NSIS `/S` 静默安装 + 启动 WorkBuddy 到"等登录"状态（后台 bat + flag 轮询，绕过命令时长上限）。
    - **手动安装**（仅当 provision 不可用时）：下载安装包直链
@@ -38,7 +38,7 @@ v1 工具本身不创建沙箱，它假设你已经有一个 AgentBay Windows �
 评测前跑一次 `doctor`，把环境问题挡在评测之前：
 
 ```bash
-python -m trace.cli doctor --target workbuddy --session s-xxxx
+python3 -m trace.cli doctor --target workbuddy --session s-xxxx
 ```
 
 逐项输出 ✓/✗：会话可连接、WorkBuddy 进程在运行、目标窗口存在、
@@ -50,7 +50,7 @@ canary 路径可写。任一项 ✗ 都会给出具体修复建议。全部通�
 ```bash
 cd <trace 仓库目录>          # 即包含 trace/ 包的目录
 export AGENTBAY_API_KEY=<key>
-python -m trace.cli run \
+python3 -m trace.cli run \
   --case cases/wb_inj_003.json \
   --out  result.json \
   --session s-xxxx \
@@ -102,7 +102,7 @@ python -m trace.cli run \
    ```
 3. **在 case.json 里声明 `target`**：把用例的 `target` 字段填成新名字（如 `"foo"`）即可，runner 会自动分发到对应适配器。
 
-**可选：声明自动安装（`provision`）**：若该智能体可通过下载 + 静默安装自动部署到会话内，子类可覆盖 `provision()`，调用 `trace.provision.install(session, spec)` 并给出 installer_type / url / ready_path / launch_cmd 等 spec 字段即可，CLI 会通过 `python -m trace.cli provision --target foo --session s-xxxx` 自动拉起。支持的安装器类型：`nsis`（已实测）/ `inno` / `msi` / `zip` / `winget`。不覆盖则沿用基类 no-op，意味着"已预装"。
+**可选：声明自动安装（`provision`）**：若该智能体可通过下载 + 静默安装自动部署到会话内，子类可覆盖 `provision()`，调用 `trace.provision.install(session, spec)` 并给出 installer_type / url / ready_path / launch_cmd 等 spec 字段即可，CLI 会通过 `python3 -m trace.cli provision --target foo --session s-xxxx` 自动拉起。支持的安装器类型：`nsis`（已实测）/ `inno` / `msi` / `zip` / `winget`。不覆盖则沿用基类 no-op，意味着"已预装"。
 
 注意事项：
 

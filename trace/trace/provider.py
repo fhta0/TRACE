@@ -12,12 +12,12 @@ from typing import Any, Optional
 
 
 # --- 屏幕稳定判据 ---
-# 实测：会话启动早期 `get_screen_size` 会返回过渡值（见过 1024x768 DPI1.0），
-# 等沙箱真正起来后才会切到真实值（1920x1060 DPI1.25）。判定标准：
-#   1. 连续两次读数完全一致（width / height / dpi 三项都等）
-#   2. 且 width > 1024（过渡值一般就是 1024）
-# 达到上述两点才认为屏幕参数可用。
-_SCREEN_STABLE_MIN_WIDTH = 1024
+# 2026-09-18 修正：1024x768 DPI1.0 **不是**启动早期的过渡值，
+# 而是"没有观看端接入时"的正常稳定态（实测：扫码打开云桌面之后才会切到 1920x1060）。
+# 所以不能把 width > 1024 作为稳定判据——在没人连云桌面之前这个条件永远不成立，
+# 必然空转满 180 秒再报 ENVIRONMENT_INVALID。
+#
+# 当前判据：连续两次读数完全一致（width / height / dpi 三项都等），不管值是多少。
 _SCREEN_STABLE_CONSECUTIVE = 2
 _SCREEN_STABLE_POLL_INTERVAL = 2.0     # 秒
 _SCREEN_STABLE_TIMEOUT = 180.0         # 秒
@@ -58,17 +58,35 @@ def _read_screen(session: Any) -> Optional[dict]:
         return None
 
 
-def wait_for_screen_stable(session: Any, timeout: float = _SCREEN_STABLE_TIMEOUT) -> dict:
+def wait_for_screen_stable(
+    session: Any,
+    timeout: float = _SCREEN_STABLE_TIMEOUT,
+    on_poll: Any | None = None,
+) -> dict:
     """轮询等屏幕参数稳定，返回稳定后的 {width, height, dpi}。
+
+    稳定判据（2026-09-18 修正）：连续两次读数完全一致，不管值是多少。
+    1024x768 DPI1.0 也是合法稳定态——只是还没有观看端接入而已。
+
+    on_poll：每次轮询后的回调（可选），签名 ``on_poll(elapsed_s, timeout, cur_reading_or_None)``。
+    用于给 CLI 一个周期性进度输出的机会——沉默和卡死对弱模型调用方无法区分。
 
     超时抛出 RuntimeError。调用方应在超时后给出明确错误（会话可能还在启动中）。
     """
     deadline = time.monotonic() + timeout
+    t_start = time.monotonic()
     last: Optional[dict] = None
     consecutive = 0
     while time.monotonic() < deadline:
         cur = _read_screen(session)
-        if cur is not None and cur["width"] > _SCREEN_STABLE_MIN_WIDTH:
+        elapsed = time.monotonic() - t_start
+        if on_poll is not None:
+            try:
+                on_poll(elapsed, timeout, cur)
+            except Exception:
+                # 回调不能影响稳定判定
+                pass
+        if cur is not None:
             if last is not None and (
                 cur["width"] == last["width"]
                 and cur["height"] == last["height"]
@@ -81,7 +99,7 @@ def wait_for_screen_stable(session: Any, timeout: float = _SCREEN_STABLE_TIMEOUT
                 consecutive = 0
             last = cur
         else:
-            # 读数失败或仍是过渡值，重置
+            # 读数失败，重置
             last = None
             consecutive = 0
         time.sleep(_SCREEN_STABLE_POLL_INTERVAL)

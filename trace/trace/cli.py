@@ -1,10 +1,13 @@
-"""TRACE CLI 入口：`python -m trace.cli run --case X.json --out Y.json [--session s-xxx]`。"""
+"""TRACE CLI 入口：`python3 -m trace.cli run --case X.json --out Y.json [--session s-xxx]`。
+若环境只有 `python` 没有 `python3`，反之替换即可。"""
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
+import threading
+import time
 import traceback
 from typing import Any
 
@@ -281,15 +284,47 @@ def _cmd_provision(args: argparse.Namespace) -> int:
     target = get_target(target_name, session)
 
     sys.stderr.write("[TRACE] 开始自动安装（后台 bat + flag 轮询）...\n")
-    try:
-        target.provision()
-    except NotImplementedError:
-        raise SystemExit(
-            f"错误：target {target_name!r} 未实现 provision()，"
-            f"请手动安装后使用 run 子命令。"
-        )
-    except RuntimeError as e:
-        sys.stderr.write(f"[TRACE] provision 失败：{e}\n")
+    sys.stderr.write(
+        "[TRACE] 提示：下载 507MB 需要数分钟；期间会持续打印进度。\n"
+    )
+    sys.stderr.flush()
+
+    # 把 target.provision() 放到后台线程，主线程每 20 秒打一次心跳。
+    # 沉默和卡死对弱模型调用方无法区分，必须让进度可见。
+    provision_error: list[BaseException | None] = [None]
+
+    def _run_provision() -> None:
+        try:
+            target.provision()
+        except BaseException as e:  # noqa: BLE001
+            provision_error[0] = e
+
+    t = threading.Thread(target=_run_provision, daemon=True)
+    t_start = time.monotonic()
+    t.start()
+    while t.is_alive():
+        t.join(timeout=20)
+        if t.is_alive():
+            elapsed = time.monotonic() - t_start
+            sys.stderr.write(
+                f"[TRACE] 安装进行中 {elapsed:.0f}s ...（下载/安装仍在继续）\n"
+            )
+            sys.stderr.flush()
+    t.join()
+
+    if provision_error[0] is not None:
+        e = provision_error[0]
+        if isinstance(e, NotImplementedError):
+            raise SystemExit(
+                f"错误：target {target_name!r} 未实现 provision()，"
+                f"请手动安装后使用 run 子命令。"
+            )
+        if isinstance(e, RuntimeError):
+            sys.stderr.write(f"[TRACE] provision 失败：{e}\n")
+            return 1
+        # 其他异常（不该发生）
+        sys.stderr.write(f"[TRACE] provision 异常：{e}\n")
+        traceback.print_exc(file=sys.stderr)
         return 1
 
     desktop_url = get_desktop_url(session)
@@ -726,29 +761,66 @@ def _cmd_session_create(args: argparse.Namespace) -> int:
             f"[TRACE] 会话已创建：{session_id}，等待屏幕参数稳定...\n"
         )
 
+    # 周期性进度回调——沉默和卡死对弱模型调用方无法区分，必须让进度可见。
+    # --json 模式也要打（JSON 只走 stdout，stderr 不影响解析）。
+    def _screen_stable_progress(elapsed_s: float, timeout_s: float, cur: Any) -> None:
+        if cur is None:
+            reading = "(读取失败)"
+        else:
+            reading = f"{cur['width']}x{cur['height']} DPI{cur['dpi']}"
+        sys.stderr.write(
+            f"[TRACE] 等待屏幕参数稳定 {int(elapsed_s)}s/{int(timeout_s)}s，"
+            f"当前读数 {reading}\n"
+        )
+        sys.stderr.flush()
+
     # 等屏幕参数稳定
     try:
-        screen = _wait_screen_stable(session)
+        screen = _wait_screen_stable(session, on_poll=_screen_stable_progress)
     except RuntimeError as e:
         # 创建成功但稳定超时——会话已经在计费，必须告诉用户 session_id 以便手动删
+        # 超时文案（§FIX-session-create-stall 第 4 节）：
+        #   - 写明会话已创建、正在计费、session_id
+        #   - 给出删除命令
+        #   - 若只是想拿地址扫码登录，可以忽略超时，直接用 `session url <id>`
         if use_json:
             json.dump({
                 "session_id": session_id,
                 "screen": None,
                 "desktop_url": None,
                 "stable": False,
+                "screen_note": (
+                    "屏幕参数未在超时内稳定，但会话已创建并正在计费。"
+                    "1024x768 是合法的稳定态（无观看端接入时的正常值），"
+                    "打开云桌面地址后分辨率通常会变化。"
+                    "如果只是想拿地址扫码登录，可以忽略本超时，直接用 `session url <id>`。"
+                ),
+                "cleanup": f"python3 -m trace.cli session rm {session_id}",
                 "error": {"code": "SCREEN_NOT_STABLE", "message": str(e)},
             }, sys.stdout, ensure_ascii=False, indent=2)
             sys.stdout.write("\n")
         else:
             sys.stderr.write(f"[TRACE] ⚠ 屏幕参数未在超时内稳定：{e}\n")
             sys.stderr.write(
-                f"[TRACE] ⚠ 会话 {session_id} 已创建并持续计费，"
-                f"请用 `python -m trace.cli session rm {session_id}` 手动清理。\n"
+                f"[TRACE] ⚠ 会话 {session_id} 已创建并持续计费。\n"
+            )
+            sys.stderr.write(
+                f"[TRACE]   - 删除命令：python3 -m trace.cli session rm {session_id}\n"
+            )
+            sys.stderr.write(
+                f"[TRACE]   - 若只是想拿地址扫码登录，可以忽略本超时，"
+                f"直接用 `python3 -m trace.cli session url {session_id}` 取地址。\n"
             )
         return EXIT_ENVIRONMENT_INVALID
 
     desktop_url = get_desktop_url(session)
+
+    # screen_note：告诉调用方当前屏幕参数的语义——
+    # 1024x768 不是异常，只是还没人连云桌面；打开云桌面地址后分辨率通常会变化。
+    screen_note = (
+        "当前无观看端接入；打开云桌面地址后分辨率通常会变化，"
+        "校准应在登录后进行"
+    )
 
     if use_json:
         json.dump({
@@ -756,6 +828,7 @@ def _cmd_session_create(args: argparse.Namespace) -> int:
             "screen": screen,
             "desktop_url": desktop_url,
             "stable": True,
+            "screen_note": screen_note,
         }, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
     else:
@@ -763,6 +836,8 @@ def _cmd_session_create(args: argparse.Namespace) -> int:
             f"[TRACE] ✓ 屏幕已稳定（{screen['width']}x{screen['height']} "
             f"DPI{screen['dpi']}）\n"
         )
+        # 解释 1024x768 不是异常——否则下一个人又会把它当成异常
+        sys.stderr.write(f"[TRACE] 注：{screen_note}\n")
         if desktop_url:
             sys.stderr.write(f"[TRACE] 云桌面地址：{desktop_url}\n")
         # 醒目的计费提示——这是让弱模型记得收尾的关键
@@ -771,19 +846,20 @@ def _cmd_session_create(args: argparse.Namespace) -> int:
             f"[TRACE] ╔══════════════════════════════════════════════════════════╗\n"
             f"[TRACE] ║  会话已创建：{session_id}（持续计费）              ║\n"
             f"[TRACE] ║  用完请务必执行：                                       ║\n"
-            f"[TRACE] ║    python -m trace.cli session rm {session_id:<17s} ║\n"
+            f"[TRACE] ║    python3 -m trace.cli session rm {session_id:<17s} ║\n"
             f"[TRACE] ╚══════════════════════════════════════════════════════════╝\n"
         )
     return EXIT_SUCCESS
 
 
-def _wait_screen_stable(session: Any, timeout: float = 180.0) -> dict:
+def _wait_screen_stable(session: Any, timeout: float = 180.0, on_poll: Any | None = None) -> dict:
     """从 provider.wait_for_screen_stable 取稳定屏幕参数。
 
     单独拎出来是为了让 cli.py 里的错误处理路径能给出 session_id 让用户手动清理。
+    on_poll 透传给 provider.wait_for_screen_stable（用于周期性进度输出）。
     """
     from .provider import wait_for_screen_stable
-    return wait_for_screen_stable(session, timeout=timeout)
+    return wait_for_screen_stable(session, timeout=timeout, on_poll=on_poll)
 
 
 def _cmd_session_rm(args: argparse.Namespace) -> int:

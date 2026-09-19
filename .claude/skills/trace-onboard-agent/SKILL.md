@@ -11,7 +11,10 @@ TRACE 在 AgentBay 云沙箱里测**桌面智能体的行为层注入安全性**
 
 判定**只认行为证据** —— 一个无害的 canary 文件有没有被创建。不看智能体嘴上说什么。
 
-仓库结构（CLI 入口 `python -m trace.cli`）：
+仓库结构（CLI 入口 `python3 -m trace.cli`）：
+
+> 若环境里只有 `python` 而没有 `python3`，把下文所有命令里的 `python3` 换成 `python` 即可。
+> （实测踩过：容器里只有 `python3`，文档原先写的 `python` 直接报 command not found。）
 
 ```
 trace/
@@ -56,7 +59,7 @@ trace/
 
 ```bash
 export AGENTBAY_API_KEY=<key>
-python -m trace.cli session create --json
+python3 -m trace.cli session create --json
 # stdout: {"session_id": "s-xxxx", "screen": {...}, "desktop_url": "...", "stable": true}
 ```
 
@@ -76,7 +79,7 @@ python -m trace.cli session create --json
 需要这个智能体的**安装包下载直链**和**静默安装方式**（绝大多数桌面软件都支持静默安装）。
 
 ```bash
-python -m trace.cli provision --target <新agent名> --session s-xxxx
+python3 -m trace.cli provision --target <新agent名> --session s-xxxx
 ```
 
 静默安装方式按安装包类型选（`provision.py` 已支持这几种）：
@@ -96,7 +99,7 @@ python -m trace.cli provision --target <新agent名> --session s-xxxx
 `provision` 成功后会打印**网页云桌面地址**。如果错过了那次打印，随时用：
 
 ```bash
-python -m trace.cli session url s-xxxx
+python3 -m trace.cli session url s-xxxx
 ```
 
 这个地址是可交互的，浏览器打开就能操作沙箱桌面。
@@ -185,7 +188,7 @@ if name == "<新agent名>":
 抄一个现有用例改个 `target` 字段跑一遍：
 
 ```bash
-python -m trace.cli run --case cases/smoke.json --out r.json \
+python3 -m trace.cli run --case cases/smoke.json --out r.json \
   --session s-xxxx --report r.html
 ```
 
@@ -200,9 +203,9 @@ python -m trace.cli run --case cases/smoke.json --out r.json \
 **测完一定要删会话。** 弱模型最容易漏的就是收尾，而忘了删就**一直计费**。用 CLI：
 
 ```bash
-python -m trace.cli session rm s-xxxx
+python3 -m trace.cli session rm s-xxxx
 # 或者兜底：一次性删掉全部会话
-python -m trace.cli session rm --all
+python3 -m trace.cli session rm --all
 ```
 
 命令会回查残留并据实报告——删干净退出码 0，有残留退出码非 0。

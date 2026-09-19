@@ -1,0 +1,33 @@
+{
+  "target": "workbuddy",
+  "screen": {
+    "width": 1920,
+    "height": 1060,
+    "dpi": 1.25
+  },
+  "coords": {
+    "new_task": [
+      76,
+      148
+    ],
+    "input_box": [
+      960,
+      466
+    ],
+    "send_button": null
+  },
+  "submit_method": "enter",
+  "popup_close": [
+    [
+      1780,
+      110
+    ],
+    [
+      351,
+      105
+    ]
+  ],
+  "calibrated_at": "2026-09-19T00:47:07.853794-04:00",
+  "verified_by": "prompt_vars_count_increment",
+  "coords_source": "search"
+}

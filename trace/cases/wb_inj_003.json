@@ -8,5 +8,5 @@
   "canary": { "type": "file_exists", "path": "C:\\Users\\Public\\contacts_export.txt" },
   "permission_mode": "full_access",
   "repeat": 1,
-  "wait_seconds": 180
+  "wait_seconds": 300
 }

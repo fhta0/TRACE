@@ -244,11 +244,21 @@ class WorkBuddyTarget(Target):
 
     # --- §FEAT-msaa-locator：MSAA 语义定位 ---
     def locate_via_msaa(self) -> dict | None:
-        """Try to locate the three controls via MSAA semantic matching.
+        """Try to locate the controls via MSAA semantic matching.
 
-        Returns {"new_task": (x,y), "input_box": (x,y), "send_button": (x,y)}
-        on success, or None if any of the three cannot be located (caller falls
-        back to the exhaustive search).
+        Required: new_task (role=37) + input_box (role=42, largest by area).
+        Optional: send_button (role=43, name="发送") — if not found, the
+        caller falls back to Enter-to-submit (same as the exhaustive-search
+        path's Phase 1).
+
+        Returns {"new_task": (x,y), "input_box": (x,y),
+                 "send_button": (x,y) | None} on success, or None if either
+        required control cannot be located (caller falls back to the
+        exhaustive search).
+
+        ★ 必需项只保留 new_task + input_box。send_button 允许为 None ——
+        穷举路径自己也用 send_button=null + 回车提交，之前给 MSAA 定了
+        比兜底路径更严的标准，是规格缺陷。
 
         Matching rules (verified on 1920x1060 DPI 1.25):
             new_task    : role=37 (PAGETAB)  and name == "新建任务"
@@ -257,7 +267,7 @@ class WorkBuddyTarget(Target):
                           (there's a smaller 34x27 sidebar text box we must skip)
                           center ~= (1118, 496)
             send_button : role=43 (PUSHBUTTON) and name == "发送"
-                          center ~= (1580, 578)
+                          center ~= (1580, 578)   [optional]
 
         No verification happens here — that is calibration's job
         (prompt-vars count +1). We just hand back the coordinates.
@@ -293,14 +303,13 @@ class WorkBuddyTarget(Target):
             screen_w=sw_i, screen_h=sh_i,
         )
 
-        if not new_task or not input_box or not send_button:
+        # ★ 必需项：new_task + input_box。send_button 允许缺失（用回车提交）。
+        if not new_task or not input_box:
             missing = []
             if not new_task:
                 missing.append("new_task")
             if not input_box:
                 missing.append("input_box")
-            if not send_button:
-                missing.append("send_button")
             sys.stderr.write(
                 f"[TRACE] MSAA 未命中（缺 {', '.join(missing)}），退回穷举搜索\n"
             )
@@ -309,11 +318,18 @@ class WorkBuddyTarget(Target):
         result = {
             "new_task": (new_task["cx"], new_task["cy"]),
             "input_box": (input_box["cx"], input_box["cy"]),
-            "send_button": (send_button["cx"], send_button["cy"]),
+            "send_button": (
+                (send_button["cx"], send_button["cy"]) if send_button else None
+            ),
         }
+        sb_disp = (
+            f"{result['send_button']}"
+            if result["send_button"] is not None
+            else "未找到，用回车提交"
+        )
         sys.stderr.write(
-            f"[TRACE] MSAA 语义定位命中：new_task={result['new_task']} "
-            f"input_box={result['input_box']} send={result['send_button']}\n"
+            f"[TRACE] MSAA 命中：new_task={result['new_task']} "
+            f"input_box={result['input_box']} send_button=({sb_disp})\n"
         )
         return result
 
