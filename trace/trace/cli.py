@@ -604,6 +604,35 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     else:
         add_check("calibration", True, "非 WorkBuddy 目标，跳过", warn=True)
 
+    # ⑧ MSAA 树可抓取（§FEAT-msaa-locator；告警，不计入 failed ——
+    # 抓不到时穷举搜索仍然兜底）。
+    if not use_json:
+        sys.stderr.write("⑧ MSAA 树可抓取 ... ")
+    if isinstance(target, WorkBuddyTarget):
+        try:
+            from . import msaa as _msaa
+            elements = _msaa.dump_tree(session, "WorkBuddy")
+            if elements:
+                add_check(
+                    "msaa_tree", True,
+                    f"MSAA 树抓取成功（{len(elements)} 个节点）",
+                )
+            else:
+                add_check(
+                    "msaa_tree", True,
+                    "MSAA 树为空（Chromium 未响应 WM_GETOBJECT 或窗口未就绪），"
+                    "退回穷举搜索仍可用",
+                    warn=True,
+                )
+        except Exception as e:
+            add_check(
+                "msaa_tree", True,
+                f"MSAA 抓取异常：{e}（穷举搜索仍可用）",
+                warn=True,
+            )
+    else:
+        add_check("msaa_tree", True, "非 WorkBuddy 目标，跳过", warn=True)
+
     ready = all(c["ok"] for c in checks)
     if use_json:
         result = {"ready": ready, "checks": checks}
@@ -638,6 +667,320 @@ def _emit_doctor_summary(failed: list[str], warnings: list[str] | None = None) -
         sys.stderr.write(
             "\n[TRACE] doctor 完成：环境就绪，可以运行评测。\n"
         )
+
+
+def _cmd_session_create(args: argparse.Namespace) -> int:
+    """创建新会话并轮询等屏幕参数稳定。
+
+    关键约束：
+      - 默认 manual_release=True，长流程不被空闲回收打断。
+      - 创建后必须等屏幕参数稳定再返回——早期 get_screen_size 会返回过渡值，
+        直接拿去 calibrate 会把坐标标错。
+      - stderr 给出醒目的计费提醒，确保弱模型调用方看到"用完要删"。
+    """
+    use_json = getattr(args, "json", False)
+
+    if not os.environ.get("AGENTBAY_API_KEY"):
+        msg = "API_KEY_MISSING: 环境变量 AGENTBAY_API_KEY 未设置"
+        if use_json:
+            json.dump({"error": {"code": "API_KEY_MISSING", "message": msg}},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write(f"[TRACE] ✗ {msg}\n")
+        return EXIT_INPUT_INVALID
+
+    provider = AgentBayProvider()
+    labels = None
+    if getattr(args, "label", None):
+        labels = {"name": args.label}
+
+    if not use_json:
+        sys.stderr.write(
+            f"[TRACE] 正在创建会话（image={args.image}, manual_release=True）...\n"
+        )
+
+    try:
+        session = provider.create_session(
+            image_id=args.image or None,
+            labels=labels,
+            manual_release=True,
+        )
+    except Exception as e:
+        msg = f"SESSION_CREATE_FAILED: {e}"
+        if use_json:
+            json.dump({"error": {"code": "SESSION_CREATE_FAILED", "message": str(e)}},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write(f"[TRACE] ✗ {msg}\n")
+        return EXIT_INTERNAL_ERROR
+
+    session_id = getattr(session, "session_id", None)
+    if not session_id:
+        sys.stderr.write("[TRACE] ✗ 创建成功但未返回 session_id\n")
+        return EXIT_INTERNAL_ERROR
+
+    if not use_json:
+        sys.stderr.write(
+            f"[TRACE] 会话已创建：{session_id}，等待屏幕参数稳定...\n"
+        )
+
+    # 等屏幕参数稳定
+    try:
+        screen = _wait_screen_stable(session)
+    except RuntimeError as e:
+        # 创建成功但稳定超时——会话已经在计费，必须告诉用户 session_id 以便手动删
+        if use_json:
+            json.dump({
+                "session_id": session_id,
+                "screen": None,
+                "desktop_url": None,
+                "stable": False,
+                "error": {"code": "SCREEN_NOT_STABLE", "message": str(e)},
+            }, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write(f"[TRACE] ⚠ 屏幕参数未在超时内稳定：{e}\n")
+            sys.stderr.write(
+                f"[TRACE] ⚠ 会话 {session_id} 已创建并持续计费，"
+                f"请用 `python -m trace.cli session rm {session_id}` 手动清理。\n"
+            )
+        return EXIT_ENVIRONMENT_INVALID
+
+    desktop_url = get_desktop_url(session)
+
+    if use_json:
+        json.dump({
+            "session_id": session_id,
+            "screen": screen,
+            "desktop_url": desktop_url,
+            "stable": True,
+        }, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        sys.stderr.write(
+            f"[TRACE] ✓ 屏幕已稳定（{screen['width']}x{screen['height']} "
+            f"DPI{screen['dpi']}）\n"
+        )
+        if desktop_url:
+            sys.stderr.write(f"[TRACE] 云桌面地址：{desktop_url}\n")
+        # 醒目的计费提示——这是让弱模型记得收尾的关键
+        sys.stderr.write(
+            f"\n"
+            f"[TRACE] ╔══════════════════════════════════════════════════════════╗\n"
+            f"[TRACE] ║  会话已创建：{session_id}（持续计费）              ║\n"
+            f"[TRACE] ║  用完请务必执行：                                       ║\n"
+            f"[TRACE] ║    python -m trace.cli session rm {session_id:<17s} ║\n"
+            f"[TRACE] ╚══════════════════════════════════════════════════════════╝\n"
+        )
+    return EXIT_SUCCESS
+
+
+def _wait_screen_stable(session: Any, timeout: float = 180.0) -> dict:
+    """从 provider.wait_for_screen_stable 取稳定屏幕参数。
+
+    单独拎出来是为了让 cli.py 里的错误处理路径能给出 session_id 让用户手动清理。
+    """
+    from .provider import wait_for_screen_stable
+    return wait_for_screen_stable(session, timeout=timeout)
+
+
+def _cmd_session_rm(args: argparse.Namespace) -> int:
+    """删除会话（单个或全部）。删后回查残留，残留情况决定退出码。
+
+    退出码：全部删干净 → 0，有残留 → EXIT_ENVIRONMENT_INVALID（钱还在烧）。
+    """
+    use_json = getattr(args, "json", False)
+
+    if not os.environ.get("AGENTBAY_API_KEY"):
+        msg = "API_KEY_MISSING: 环境变量 AGENTBAY_API_KEY 未设置"
+        if use_json:
+            json.dump({"error": {"code": "API_KEY_MISSING", "message": msg}},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write(f"[TRACE] ✗ {msg}\n")
+        return EXIT_INPUT_INVALID
+
+    provider = AgentBayProvider()
+
+    # 收集要删除的 session_id 列表
+    targets: list[str] = []
+    if getattr(args, "all", False):
+        # --all：先把当前能列出来的都拿一遍。注意 list 不可靠，
+        # 所以这里只是"尽力而为"——真正判残留要等删完后再 list 一次。
+        listing = provider.list_sessions()
+        if listing["success"]:
+            targets = listing["session_ids"]
+        if not use_json:
+            sys.stderr.write(
+                f"[TRACE] --all：从 list() 拿到 {len(targets)} 个会话 "
+                f"（注意：list 结果不可靠，可能遗漏）\n"
+            )
+    else:
+        sid = getattr(args, "session_id", None)
+        if not sid:
+            if use_json:
+                json.dump({"error": {"code": "ARGUMENT_MISSING",
+                                     "message": "必须提供 session_id 或 --all"}},
+                          sys.stdout, ensure_ascii=False, indent=2)
+                sys.stdout.write("\n")
+            else:
+                sys.stderr.write("[TRACE] ✗ 必须提供 session_id 或 --all\n")
+            return EXIT_INPUT_INVALID
+        targets = [sid]
+
+    results: list[dict] = []
+    for sid in targets:
+        if not use_json:
+            sys.stderr.write(f"[TRACE] 删除 {sid} ...\n")
+        del_result = provider.delete_session(sid)
+        # 回查残留
+        residual = not provider.verify_gone(sid)
+        results.append({
+            "session_id": sid,
+            "delete_success": del_result["success"],
+            "delete_error": del_result.get("error"),
+            "already_gone": del_result.get("already_gone", False),
+            "residual": residual,
+        })
+        if not use_json:
+            if del_result.get("already_gone"):
+                sys.stderr.write(f"[TRACE]   ✓ {sid} 已不存在\n")
+            elif del_result["success"] and not residual:
+                sys.stderr.write(f"[TRACE]   ✓ {sid} 已删除并确认无残留\n")
+            elif del_result["success"] and residual:
+                sys.stderr.write(
+                    f"[TRACE]   ⚠ {sid} 删除 API 返回成功，但回查仍存在——"
+                    f"可能仍在计费\n"
+                )
+            else:
+                sys.stderr.write(
+                    f"[TRACE]   ✗ {sid} 删除失败："
+                    f"{del_result.get('error') or 'unknown error'}\n"
+                )
+
+    any_residual = any(r["residual"] for r in results)
+    any_failed = any(not r["delete_success"] and not r.get("already_gone")
+                     for r in results)
+
+    if use_json:
+        json.dump({
+            "deleted": len([r for r in results if r["delete_success"] or r["already_gone"]]),
+            "failed": len([r for r in results if not r["delete_success"] and not r.get("already_gone")]),
+            "residual": len([r for r in results if r["residual"]]),
+            "results": results,
+        }, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        if not results:
+            sys.stderr.write("[TRACE] 没有找到要删除的会话。\n")
+        if any_residual or any_failed:
+            sys.stderr.write(
+                f"\n[TRACE] ⚠ 收尾未干净：{sum(r['residual'] for r in results)} 个残留，"
+                f"{sum(1 for r in results if not r['delete_success'] and not r.get('already_gone'))} 个失败。"
+                f"请检查 API 密钥权限或稍后重试。\n"
+            )
+        else:
+            sys.stderr.write(
+                f"\n[TRACE] ✓ 已删除 {len(results)} 个会话，全部确认无残留。\n"
+            )
+
+    return EXIT_SUCCESS if not (any_residual or any_failed) else EXIT_ENVIRONMENT_INVALID
+
+
+def _cmd_session_list(args: argparse.Namespace) -> int:
+    """列举会话。
+
+    ⚠️ 已知问题：ab.list() 在有会话运行时曾返回空列表——结果不可靠。
+    输出里必须写明这一点；绝不能让调用方把"list 为空"当成"没在计费"的证据。
+    """
+    use_json = getattr(args, "json", False)
+
+    if not os.environ.get("AGENTBAY_API_KEY"):
+        msg = "API_KEY_MISSING: 环境变量 AGENTBAY_API_KEY 未设置"
+        if use_json:
+            json.dump({"error": {"code": "API_KEY_MISSING", "message": msg}},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write(f"[TRACE] ✗ {msg}\n")
+        return EXIT_INPUT_INVALID
+
+    provider = AgentBayProvider()
+    status_filter = getattr(args, "status", None)
+    listing = provider.list_sessions(status=status_filter or None)
+
+    reliability_warning = (
+        "⚠️ list() 实测不可靠——有会话运行时曾返回空列表。"
+        "空结果不能作为'没有会话在计费'的证据。"
+        "要确认计费状态，请登录 AgentBay 控制台查看。"
+    )
+
+    if use_json:
+        json.dump({
+            "success": listing["success"],
+            "session_ids": listing["session_ids"],
+            "total_count": listing["total_count"],
+            "status_filter": status_filter,
+            "reliability_warning": reliability_warning,
+            "error": listing.get("error"),
+        }, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        sys.stderr.write(
+            f"[TRACE] {reliability_warning}\n"
+        )
+        if not listing["success"]:
+            sys.stderr.write(
+                f"[TRACE] ✗ list() 调用失败：{listing.get('error') or 'unknown error'}\n"
+            )
+            return EXIT_INTERNAL_ERROR
+        ids = listing["session_ids"]
+        if status_filter:
+            sys.stderr.write(f"[TRACE] 过滤 status={status_filter}\n")
+        if not ids:
+            sys.stderr.write(
+                "[TRACE] list() 返回空列表（再次提醒：这可能是 API 的已知问题，"
+                "不代表没有会话在计费）。\n"
+            )
+        else:
+            sys.stderr.write(f"[TRACE] 共 {len(ids)} 个会话：\n")
+            for sid in ids:
+                sys.stderr.write(f"        {sid}\n")
+    return EXIT_SUCCESS
+
+
+def _cmd_session_url(args: argparse.Namespace) -> int:
+    """打印云桌面地址。可重复执行——authcode 过期就重跑。"""
+    sid = args.session_id
+
+    if not os.environ.get("AGENTBAY_API_KEY"):
+        sys.stderr.write("[TRACE] ✗ API_KEY_MISSING: 环境变量 AGENTBAY_API_KEY 未设置\n")
+        return EXIT_INPUT_INVALID
+
+    provider = AgentBayProvider()
+    try:
+        session = provider.get_session(sid)
+    except RuntimeError as e:
+        sys.stderr.write(f"[TRACE] ✗ SESSION_NOT_FOUND: {e}\n")
+        return EXIT_ENVIRONMENT_INVALID
+
+    url = get_desktop_url(session)
+    if not url:
+        sys.stderr.write(
+            f"[TRACE] ✗ 无法获取会话 {sid} 的云桌面地址（info() 没返回 resource_url）\n"
+        )
+        return EXIT_INTERNAL_ERROR
+
+    # URL 直接输出到 stdout（纯值，方便脚本 `$(...)` 捕获）
+    sys.stdout.write(url + "\n")
+    sys.stderr.write(
+        f"[TRACE] 会话 {sid} 的云桌面地址（浏览器打开可交互）。\n"
+        f"[TRACE] 注意：authcode 有时效，过期重跑本命令即可。\n"
+    )
+    return EXIT_SUCCESS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -728,6 +1071,78 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     pc.set_defaults(func=_cmd_calibrate)
+
+    # ---- session 子命令组：会话生命周期 ----
+    ps = sub.add_parser(
+        "session",
+        help="会话生命周期：create / rm / list / url。上游测评平台不用管这组——会话由人工准备好。skill 使用者（工具内的模型）走完整流程才需要。",
+    )
+    ss = ps.add_subparsers(dest="session_cmd", required=True)
+
+    # session create
+    psc = ss.add_parser(
+        "create",
+        help="创建新会话（默认 manual_release=True，避免长流程被自动回收）。创建后轮询等屏幕参数稳定再返回。",
+    )
+    psc.add_argument(
+        "--image", default="windows_latest",
+        help="镜像 ID（默认 windows_latest）。",
+    )
+    psc.add_argument(
+        "--label", default=None,
+        help="给会话打一个 name label，便于 list 时辨识（可选）。",
+    )
+    psc.add_argument(
+        "--json", action="store_true",
+        help="输出结构化 JSON 到 stdout（session_id / screen / desktop_url）。",
+    )
+    psc.set_defaults(func=_cmd_session_create)
+
+    # session rm
+    psr = ss.add_parser(
+        "rm",
+        help="删除会话。删后回查残留，残留情况决定退出码。--all 删除全部（用于收尾兜底）。",
+    )
+    psr.add_argument(
+        "session_id", nargs="?", default=None,
+        help="要删除的会话 ID。与 --all 二选一。",
+    )
+    psr.add_argument(
+        "--all", action="store_true",
+        help="删除全部会话（基于 list()，注意 list 不可靠）。",
+    )
+    psr.add_argument(
+        "--json", action="store_true",
+        help="输出结构化 JSON 到 stdout。",
+    )
+    psr.set_defaults(func=_cmd_session_rm)
+
+    # session list
+    psl = ss.add_parser(
+        "list",
+        help="列举会话。⚠️ 已知问题：ab.list() 实测不可靠——空结果不能作为'没在计费'的证据。",
+    )
+    psl.add_argument(
+        "--status", default=None,
+        help="按状态过滤（RUNNING / PAUSED / DELETING / DELETED 等，具体取值见 SDK）。",
+    )
+    psl.add_argument(
+        "--json", action="store_true",
+        help="输出结构化 JSON 到 stdout。",
+    )
+    psl.set_defaults(func=_cmd_session_list)
+
+    # session url
+    psu = ss.add_parser(
+        "url",
+        help="打印云桌面地址（可重复执行；authcode 过期就重跑）。",
+    )
+    psu.add_argument(
+        "session_id",
+        help="会话 ID。",
+    )
+    psu.set_defaults(func=_cmd_session_url)
+
     return p
 
 

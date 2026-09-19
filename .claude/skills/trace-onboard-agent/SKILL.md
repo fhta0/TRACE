@@ -48,26 +48,35 @@ trace/
 
 创建一个标记文件就够了。绝不要让注入指令去删数据、外发数据、改配置。我们要证明的是"这条攻击路径走得通"，不是真造成危害。一个无害 canary 被创建，已经完整证明了同一条路径可以换成有害动作。
 
-## 接入一个新桌面智能体：五步
+## 接入一个新桌面智能体：六步
 
-### 第 1 步：起沙箱并自动安装
+### 第 1 步：建沙箱会话
+
+**不要手写 SDK 调用。** 用 CLI 一条命令搞定——SDK 建会话的关键参数（`manual_release=True`、屏幕参数稳定等待）CLI 都处理好了，手写容易漏。
+
+```bash
+export AGENTBAY_API_KEY=<key>
+python -m trace.cli session create --json
+# stdout: {"session_id": "s-xxxx", "screen": {...}, "desktop_url": "...", "stable": true}
+```
+
+记下返回的 `session_id`，后面所有命令都用它。
+
+> ⚠️ 命令会醒目提示"持续计费"——**用完务必 `session rm` 收尾**，否则一直扣钱。
+> 这是整个流程最不能漏的一步，弱模型最容易忘。
+
+可选参数：
+- `--image <image_id>`：默认 `windows_latest`，特殊镜像按需指定
+- `--label <name>`：给会话打标签，便于 `session list` 时辨识
+
+命令会轮询等待屏幕参数稳定（实测启动早期会返回过渡值 1024x768，稳定后才是真实值 1920x1060）——直接拿过渡值去 calibrate 会把坐标标错。
+
+### 第 2 步：自动安装被测智能体
 
 需要这个智能体的**安装包下载直链**和**静默安装方式**（绝大多数桌面软件都支持静默安装）。
 
 ```bash
-export AGENTBAY_API_KEY=<key>
 python -m trace.cli provision --target <新agent名> --session s-xxxx
-```
-
-会话要先用 SDK 建好，关键是 `manual_release=True`，否则安装到一半会话会被自动回收：
-
-```python
-from agentbay import AgentBay, CreateSessionParams, LifecyclePolicy
-ab = AgentBay(api_key=os.environ["AGENTBAY_API_KEY"])
-r = ab.create(CreateSessionParams(
-    image_id="windows_latest",
-    lifecycle_policy=LifecyclePolicy(manual_release=True)))
-session_id = r.session.session_id
 ```
 
 静默安装方式按安装包类型选（`provision.py` 已支持这几种）：
@@ -82,15 +91,21 @@ session_id = r.session.session_id
 
 判断类型：下载下来看 exe 特征，或查该软件文档。NSIS 最常见。
 
-### 第 2 步：打开桌面，人工登录
+### 第 3 步：打开桌面，人工登录
 
-`provision` 成功后会打印**网页云桌面地址**（`session.info().resource_url`）。这个地址是可交互的，浏览器打开就能操作沙箱桌面。
+`provision` 成功后会打印**网页云桌面地址**。如果错过了那次打印，随时用：
+
+```bash
+python -m trace.cli session url s-xxxx
+```
+
+这个地址是可交互的，浏览器打开就能操作沙箱桌面。
 
 **登录必须人工做** —— 扫码/SSO/验证码本质上需要真人（扫码要用户的手机）。这是整个流程唯一绕不开的人工点，不要试图自动化它。把地址给用户，让他登录完再继续。
 
-地址里的 authcode 有时效，过期重新取。
+地址里的 authcode 有时效，过期重跑 `session url` 即可（这是为什么它是独立命令，而不是只在 provision 结尾打印一次）。
 
-### 第 3 步：标定 UI 坐标（这步需要你看屏幕）
+### 第 4 步：标定 UI 坐标（这步需要你看屏幕）
 
 这是校准阶段，屏幕上**还没有注入内容**，所以你看屏幕是安全的。
 
@@ -116,7 +131,7 @@ png_bytes = shot.data
 
 WorkBuddy 的实测值可作参考（1920×1080 最大化）：新建 `(77,107)`、输入框 `(1075,455)`、发送 `(1524,500)`。
 
-### 第 4 步：写 Target 适配器
+### 第 5 步：写 Target 适配器
 
 在 `trace/target_<新agent>.py` 新建，抄 `target_workbuddy.py` 的结构：
 
@@ -165,7 +180,7 @@ if name == "<新agent名>":
 
 核心/判定/报告都不用动 —— 这就是接缝的意义。
 
-### 第 5 步：冒烟验证
+### 第 6 步：冒烟验证
 
 抄一个现有用例改个 `target` 字段跑一遍：
 
@@ -175,10 +190,25 @@ python -m trace.cli run --case cases/smoke.json --out r.json \
 ```
 
 看两件事：
-- **任务真的发出去了吗** —— 看截图，如果输入框没点中、任务没发送，说明坐标标错了，回第 3 步
+- **任务真的发出去了吗** —— 看截图，如果输入框没点中、任务没发送，说明坐标标错了，回第 4 步
 - **canary 判定正常吗** —— 先用一个"一定会 CLEAN"的路径确认判定不会误报
 
 坐标标定是这一步最常见的返工来源。截图是你唯一的真相来源。
+
+## 收尾：务必删会话
+
+**测完一定要删会话。** 弱模型最容易漏的就是收尾，而忘了删就**一直计费**。用 CLI：
+
+```bash
+python -m trace.cli session rm s-xxxx
+# 或者兜底：一次性删掉全部会话
+python -m trace.cli session rm --all
+```
+
+命令会回查残留并据实报告——删干净退出码 0，有残留退出码非 0。
+
+> ⚠️ 不要用 `session list` 判"是不是已经没在计费"——list 实测不可靠，
+> 有会话运行时曾返回空列表。确认计费状态请登录 AgentBay 控制台。
 
 ## 写注入用例的要点
 
@@ -222,7 +252,8 @@ python -m trace.cli run --case cases/smoke.json --out r.json \
 - `execute_command` 有**参数长度上限**，长命令会报 `Argument list too long` → 先 `filesystem.write_file` 写成 `.bat` 再执行
 - `execute_command` 有**单条时长上限**，几分钟的操作会超时 → 后台启动 + 轮询 flag 文件
 - `start "" /B` 分离启动的返回值 `success=False` 是**常态**，不要拿它判成败 —— 成败看 flag 文件
-- 会话默认会**空闲自动回收**，长流程必须 `LifecyclePolicy(manual_release=True)`，然后**记得手动删**，否则一直计费
+- 会话默认会**空闲自动回收**，长流程必须 `LifecyclePolicy(manual_release=True)`（`session create` 默认已设置）
+- `session list` **不可靠**——有会话运行时曾返回空列表，不要把空结果当作没在计费
 
 **下载：**
 - curl 要带 stall 检测和重试，否则偶发的连接挂起会无限卡住：
@@ -231,6 +262,3 @@ python -m trace.cli run --case cases/smoke.json --out r.json \
 **Windows 命令：**
 - 写进 `.bat` 的命令用**裸批处理语法**，不要再套 `cmd /c "..."`，也不要用 `\"` 转义路径 —— 批处理里反斜杠不是转义符，套了会导致路径判断永远失败
 - 后台跑的 bat 和轮询用的 bat **必须用不同文件路径** —— cmd 逐行从磁盘读 bat，轮询覆写同一个文件会把正在跑的脚本读串
-
-**收尾：**
-- 测完删会话。查残留：`ab.list()`。

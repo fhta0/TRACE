@@ -56,6 +56,12 @@ _STABLE_POLLS = 3        # 连续多少次「画面无实质变化」才算完�
 _DELIVERY_POLL_INTERVAL = 1.0   # 秒
 _DELIVERY_POLL_TIMEOUT = 20.0   # 秒
 
+# §FEAT-msaa-locator：MSAA role 常量（只列用到的）。
+# 完整列表见 IAccessible / ROLE_SYSTEM_*，下面三个是 WorkBuddy 定位用得到的。
+_ROLE_PAGETAB = 37      # ROLE_SYSTEM_PAGETAB   —— 「新建任务」页签
+_ROLE_TEXT = 42         # ROLE_SYSTEM_TEXT      —— 可编辑文本框（输入框）
+_ROLE_PUSHBUTTON = 43   # ROLE_SYSTEM_PUSHBUTTON —— 「发送」按钮
+
 
 # ---------------------------------------------------------------------------
 # Screen-info helper (shared by instance method and calibration module)
@@ -235,6 +241,81 @@ class WorkBuddyTarget(Target):
             self.session.computer.click_mouse(x, y)
         else:
             self.session.computer.press_keys(["Enter"])
+
+    # --- §FEAT-msaa-locator：MSAA 语义定位 ---
+    def locate_via_msaa(self) -> dict | None:
+        """Try to locate the three controls via MSAA semantic matching.
+
+        Returns {"new_task": (x,y), "input_box": (x,y), "send_button": (x,y)}
+        on success, or None if any of the three cannot be located (caller falls
+        back to the exhaustive search).
+
+        Matching rules (verified on 1920x1060 DPI 1.25):
+            new_task    : role=37 (PAGETAB)  and name == "新建任务"
+                          center ~= (165, 134)
+            input_box   : role=42 (TEXT), take the largest by area
+                          (there's a smaller 34x27 sidebar text box we must skip)
+                          center ~= (1118, 496)
+            send_button : role=43 (PUSHBUTTON) and name == "发送"
+                          center ~= (1580, 578)
+
+        No verification happens here — that is calibration's job
+        (prompt-vars count +1). We just hand back the coordinates.
+        """
+        from . import msaa as _msaa
+
+        elements = _msaa.dump_tree(self.session, "WorkBuddy")
+        if not elements:
+            sys.stderr.write(
+                "[TRACE] MSAA 未命中（empty tree），退回穷举搜索\n"
+            )
+            return None
+
+        info = self._screen_info() or {}
+        sw = info.get("width")
+        sh = info.get("height")
+        try:
+            sw_i: int | None = int(sw) if sw else None
+            sh_i: int | None = int(sh) if sh else None
+        except (TypeError, ValueError):
+            sw_i, sh_i = None, None
+
+        new_task = _msaa.find(
+            elements, role=_ROLE_PAGETAB, name="新建任务",
+            screen_w=sw_i, screen_h=sh_i,
+        )
+        input_box = _msaa.find(
+            elements, role=_ROLE_TEXT,
+            screen_w=sw_i, screen_h=sh_i,
+        )  # largest by area — drops the 34x27 sidebar decoy automatically
+        send_button = _msaa.find(
+            elements, role=_ROLE_PUSHBUTTON, name="发送",
+            screen_w=sw_i, screen_h=sh_i,
+        )
+
+        if not new_task or not input_box or not send_button:
+            missing = []
+            if not new_task:
+                missing.append("new_task")
+            if not input_box:
+                missing.append("input_box")
+            if not send_button:
+                missing.append("send_button")
+            sys.stderr.write(
+                f"[TRACE] MSAA 未命中（缺 {', '.join(missing)}），退回穷举搜索\n"
+            )
+            return None
+
+        result = {
+            "new_task": (new_task["cx"], new_task["cy"]),
+            "input_box": (input_box["cx"], input_box["cy"]),
+            "send_button": (send_button["cx"], send_button["cy"]),
+        }
+        sys.stderr.write(
+            f"[TRACE] MSAA 语义定位命中：new_task={result['new_task']} "
+            f"input_box={result['input_box']} send={result['send_button']}\n"
+        )
+        return result
 
     # --- §FIX-verified-steps：确定性环境/状态探测 ---
     # ★ SDK 返回对象的 str() 是 repr（如 <DirectoryEntry object at 0x...>），不含内容；

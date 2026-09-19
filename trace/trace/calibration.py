@@ -323,6 +323,106 @@ def _try_probe(
 
 
 # ---------------------------------------------------------------------------
+# §FEAT-msaa-locator: MSAA-first candidate
+# ---------------------------------------------------------------------------
+
+def _try_msaa_first(
+    target_obj: Any,
+    target_name: str,
+    width: int, height: int, dpi: float,
+) -> dict | None:
+    """Try MSAA semantic locate + prompt-vars verification.
+
+    Returns a verified calibration dict on success (coords_source="msaa"),
+    or None on any failure so the caller falls through to the exhaustive
+    search. Never raises — all exceptions are caught and logged to stderr.
+
+    Verification uses the exact same iron criterion as the exhaustive path:
+    the prompt-vars file count must strictly increase after a probe submit.
+    MSAA being a "better guess" does not change what "success" means.
+    """
+    try:
+        msaa_coords = target_obj.locate_via_msaa()
+    except Exception as e:
+        sys.stderr.write(
+            f"[TRACE] MSAA 路径异常：{e}，退回穷举搜索\n"
+        )
+        return None
+
+    if not msaa_coords:
+        # locate_via_msaa already logged "MSAA 未命中 (...)" to stderr.
+        return None
+
+    nt_xy = msaa_coords["new_task"]
+    ib_xy = msaa_coords["input_box"]
+    sb_xy = msaa_coords["send_button"]
+
+    # Snapshot prompt-vars baseline before the probe.
+    n_before = _count_prompt_vars(target_obj)
+    if n_before < 0:
+        sys.stderr.write(
+            "[TRACE] MSAA 验证跳过：prompt-vars 信号不可用，退回穷举搜索\n"
+        )
+        return None
+
+    comp = target_obj.session.computer
+    try:
+        # Normalize layout (new-task click + close popup), same as the
+        # exhaustive search does per probe.
+        _normalize_before_probe(target_obj, nt_xy)
+        _close_popup_default(target_obj)
+
+        # Click new-task
+        comp.click_mouse(nt_xy[0], nt_xy[1])
+        time.sleep(1.5)
+
+        # Click input box
+        comp.click_mouse(ib_xy[0], ib_xy[1])
+        time.sleep(0.8)
+
+        # Clear input (defensive: same sequence as _try_probe)
+        comp.press_keys(["ctrl", "a"])
+        time.sleep(0.2)
+        for _ in range(80):
+            comp.press_keys(["BackSpace"])
+        time.sleep(0.2)
+
+        # Type probe text
+        comp.input_text(_PROBE_TEXT)
+        time.sleep(0.5)
+
+        # Submit — try Enter first; MSAA has given us a send_button but
+        # we still prefer Enter (cheaper, fewer assumptions). If the probe
+        # fails, the exhaustive search's Phase 2 will try click-submit.
+        comp.press_keys(["Enter"])
+
+        if _wait_for_increment(target_obj, n_before):
+            n_after = _count_prompt_vars(target_obj)
+            sys.stderr.write(
+                f"[TRACE] MSAA 坐标验证通过"
+                f"（prompt-vars {n_before} -> {n_after}），"
+                f"跳过穷举搜索\n"
+            )
+            return _build_calibration(
+                target_name, width, height, dpi,
+                new_task=nt_xy, input_box=ib_xy,
+                submit_method="enter", send_button=sb_xy,
+                coords_source="msaa",
+            )
+
+        sys.stderr.write(
+            "[TRACE] MSAA 坐标验证未通过"
+            "（prompt-vars 未增加），退回穷举搜索\n"
+        )
+        return None
+    except Exception as e:
+        sys.stderr.write(
+            f"[TRACE] MSAA 验证探针异常：{e}，退回穷举搜索\n"
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Top-level search
 # ---------------------------------------------------------------------------
 
@@ -332,14 +432,18 @@ def calibrate(target_obj: Any, target_name: str) -> dict | None:
     Returns None if no valid combination was found after exhausting all
     candidates.
 
-    Strategy (see FEAT-self-calibration.md):
-      Phase 1 — new-task × input-box × Enter key
-      Phase 2 — new-task × input-box × send-button click
-                (only if Phase 1 failed for every input candidate)
+    Strategy:
+      0. MSAA first (FEAT-msaa-locator.md) — semantic locate by name/role.
+         If it produces coordinates, verify them with the same prompt-vars
+         criterion as the exhaustive search. On pass, return immediately.
+         On fail (or if MSAA can't locate), fall through to step 1.
+      1. Phase 1 — new-task × input-box × Enter key (exhaustive)
+      2. Phase 2 — new-task × input-box × send-button click
+                   (only if Phase 1 failed for every input candidate)
       Stop at first verified combination (each probe may consume real quota).
     """
     # Get current screen info
-    from .target_workbuddy import _get_screen_info
+    from .target_workbuddy import WorkBuddyTarget, _get_screen_info
     info = _get_screen_info(target_obj.session)
     if not info:
         raise RuntimeError("Cannot get screen info for calibration")
@@ -355,6 +459,18 @@ def calibrate(target_obj: Any, target_name: str) -> dict | None:
         f"[TRACE] calibrate: screen {width}x{height} DPI{dpi}, "
         f"target={target_name}\n"
     )
+
+    # ------------------------------------------------------------------
+    # Step 0: §FEAT-msaa-locator — MSAA as the first-priority candidate
+    # source. Does NOT replace the exhaustive search: MSAA just hands us
+    # a guess, and we still verify it with the prompt-vars iron ground
+    # truth. The criterion is identical to the search path.
+    # ------------------------------------------------------------------
+    if isinstance(target_obj, WorkBuddyTarget):
+        msaa_result = _try_msaa_first(target_obj, target_name, width, height, dpi)
+        if msaa_result is not None:
+            return msaa_result
+        # msaa_result is None → fall through to exhaustive search below
 
     new_task_cands = _new_task_candidates(width, height)
     input_cands = _input_box_candidates(width, height)
@@ -419,8 +535,15 @@ def _build_calibration(
     input_box: tuple[int, int],
     submit_method: str,
     send_button: tuple[int, int] | None,
+    coords_source: str = "search",
 ) -> dict:
-    """Build a calibration dict from verified coordinates."""
+    """Build a calibration dict from verified coordinates.
+
+    `coords_source` records how the coordinates were obtained:
+      - "msaa"   — MSAA semantic locator (FEAT-msaa-locator.md)
+      - "search" — exhaustive prompt-vars-verified search
+    Diagnostic only; not used by the runner. Helps triage which path fired.
+    """
     from .target_workbuddy import _COORD_POPUP_CLOSE_CARD, _COORD_POPUP_CLOSE_PANEL
 
     now = datetime.now(timezone.utc).astimezone().isoformat()
@@ -436,4 +559,5 @@ def _build_calibration(
         "popup_close": [list(_COORD_POPUP_CLOSE_PANEL), list(_COORD_POPUP_CLOSE_CARD)],
         "calibrated_at": now,
         "verified_by": "prompt_vars_count_increment",
+        "coords_source": coords_source,
     }
