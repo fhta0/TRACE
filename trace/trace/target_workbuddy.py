@@ -175,8 +175,11 @@ class WorkBuddyTarget(Target):
 
         安装链（已由协调方实测）：
           1. curl 下载 507MB NSIS 安装包到 C:\\Users\\Public\\_trace_installer.exe
-          2. `<installer> /S` 静默安装（NSIS 标准标志）
+          2. `<installer> /S /D=<用户目录>` 静默安装（NSIS 标准标志）
           3. 启动 WorkBuddy.exe 等待用户扫码登录
+
+        2026-09-20 修正：安装路径改为用户目录，避开 Program Files 权限问题。
+        AgentBay 沙箱可能限制了管理员 token，导致写 Program Files 失败（EXITCODE=5）。
         """
         from . import provision as _prov
 
@@ -186,7 +189,9 @@ class WorkBuddyTarget(Target):
                 "https://download.codebuddy.cn/workbuddy/saas/win32-x64-user/"
                 "WorkBuddy-win32-x64-user-5.5.6.38337834-5f969292.exe"
             ),
-            # 两种安装位置均存在（用户级 / 机器级），任一存在即算就绪
+            # 2026-09-20 修正：强制安装到用户目录，避开 Program Files 权限问题
+            "install_dir": r"C:\Users\Administrator\AppData\Local\Programs\WorkBuddy",
+            # 安装位置：用户目录（主要）/ 机器目录（备用）
             "ready_path": [
                 r"C:\Users\Administrator\AppData\Local\Programs"
                 r"\WorkBuddy\WorkBuddy.exe",

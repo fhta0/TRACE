@@ -178,38 +178,53 @@ def _build_bat_body(spec: dict, tmp_path: str) -> str:
         spec: 安装规格
         tmp_path: 临时安装包路径
 
-    bat 只做：清旧 flag + 安装 + 打新 flag。
+    bat 只做：清旧 flag + 安装（前台等待）+ 检查退出码 + 打新 flag。
     下载由 Python 侧看门狗驱动（2026-09-18 修正）。
+
+    2026-09-20 修正：安装程序必须前台等待退出码，不能 start /B 后立刻打 flag。
+    否则即使安装失败（EXITCODE=5），flag 也标记 DONE，导致误判。
     """
     itype = spec["installer_type"]
     silent_args = spec.get("silent_args") or _DEFAULT_SILENT.get(itype)
     url = spec.get("url")
 
+    # 用户自定义安装路径（避开 Program Files 权限问题）
+    install_dir = spec.get("install_dir")
+
     lines: list[str] = []
 
-    # 1) 清旧 flag，避免读到上一轮结果（写在 bat 首行，保证 start 后立刻执行）
+    # 1) 清旧 flag，避免读到上一轮结果
     lines.append(f'if exist "{_FLAG_PATH}" del /f /q "{_FLAG_PATH}"')
 
     if itype == "winget":
         # winget 直接 install，无下载步
         effective = silent_args or _DEFAULT_SILENT["winget"]
         lines.append(f'winget install --id {spec["winget_id"]} {effective}')
+        lines.append('if %ERRORLEVEL% NEQ 0 (echo INSTALL_FAILED>&2 & exit /b %ERRORLEVEL%)')
     else:
         if itype in ("nsis", "inno"):
-            lines.append(f'"{tmp_path}" {silent_args}')
+            # 2026-09-20 修正：NSIS/Inno 前台等待，检查退出码
+            # 若有 install_dir，NSIS 加 /D 参数（必须放最后）
+            if install_dir and itype == "nsis":
+                lines.append(f'"{tmp_path}" {silent_args} /D={install_dir}')
+            else:
+                lines.append(f'"{tmp_path}" {silent_args}')
+            lines.append('if %ERRORLEVEL% NEQ 0 (echo INSTALL_FAILED exitcode=%ERRORLEVEL%>&2 & exit /b %ERRORLEVEL%)')
         elif itype == "msi":
             args = silent_args or "/quiet /norestart"
             lines.append(f'msiexec /i "{tmp_path}" {args}')
+            lines.append('if %ERRORLEVEL% NEQ 0 (echo INSTALL_FAILED exitcode=%ERRORLEVEL%>&2 & exit /b %ERRORLEVEL%)')
         elif itype == "zip":
             install_dir = spec["install_dir"]
             lines.append(
                 f'powershell -NoProfile -Command '
                 f'"Expand-Archive -Force \'{tmp_path}\' \'{install_dir}\'"'
             )
+            lines.append('if %ERRORLEVEL% NEQ 0 (echo INSTALL_FAILED>&2 & exit /b %ERRORLEVEL%)')
         else:  # pragma: no cover - _validate_spec guards this
             raise ValueError(f"未处理：{itype}")
 
-    # 结尾打 flag
+    # 结尾打 flag（只有安装成功才会到这里）
     lines.append(f'echo DONE> "{_FLAG_PATH}"')
     return "\n".join(lines)
 
