@@ -16,6 +16,7 @@ deepseek-harness 是一个基于插件架构的 agent harness（TypeScript/Node.
 """
 from __future__ import annotations
 
+import json
 import sys
 import time
 from typing import Any
@@ -140,11 +141,33 @@ class DeepseekHarnessTarget(Target):
         sys.stderr.write(f"[TRACE] 文档已投放: {path}\n")
         return path
 
-    def dispatch(self, benign_task: str, wait_seconds: int) -> bytes:
-        """通过 headless 模式运行 deepseek-harness 代理执行任务。
+    def dispatch(self, benign_task: str, wait_seconds: int) -> tuple[bytes, str]:
+        """通过 headless 模式运行 deepseek-harness 代理执行任务，并用 --json 事件流做确定性投递校验。
 
-        命令：dsh --profile headless "任务内容"
-        代理会读取工作区文件、执行命令，完成后退出。
+        投递校验信号（来自 FINDING-dsh-delivery-signal.md）：
+          1. stdout JSONL 事件流（--json 模式）—— 来自 json-stream.ts:259-316 的事件分类
+          2. 退出码（0=completed, 1=error/completed-with-error）—— 来自 index.ts:373-380
+
+        事件类型（来自 json-stream.ts）：
+          - session: 会话启动事件（json-stream.ts:318）
+          - status: 阶段事件（turn_start, step_start, step_end, turn_end）
+          - thinking: 推理块
+          - text: 文本块（assistant/message 的 text content）
+          - tool_call: 工具调用（tool/call）
+          - tool_result: 工具结果（tool/result）
+          - final: 最终答案（json-stream.ts:321-326）
+          - error: 错误事件（startup.ts:84-93, index.ts:296-301）
+
+        判定逻辑（铁律：判不了/没跑起来绝不返回 OK，宁可 NOT_DELIVERED）：
+          - 出现过 run 事件（session/status/text/tool_call/tool_result/thinking/final 任一）
+            且退出码 0 或 1 → "OK"
+          - 无 run 事件或进程未启动（stdout 为空或无有效 JSON 事件）→ "NOT_DELIVERED"
+          - 退出码非 0/1 → "ERROR_STATE"
+          - 有事件但全是 error 类型 → "ERROR_STATE"
+
+        返回 (evidence_bytes, status):
+          - evidence_bytes: stdout JSONL 事件流原文（UTF-8 编码），runner 当证据存文件
+          - status: "OK" | "NOT_DELIVERED" | "ERROR_STATE"
         """
         if not self._dsh_ready:
             raise RuntimeError("deepseek-harness 未就绪，请先运行 provision")
@@ -155,26 +178,117 @@ class DeepseekHarnessTarget(Target):
         if api_key:
             self._run_cmd(f'set DEEPSEEK_API_KEY={api_key}')
 
-        # 构建任务命令
-        # 使用 headless 模式，任务内容通过命令行参数传递
+        # 构建命令：使用 --json 模式获取事件流（FINDING Q2）
         task_escaped = benign_task.replace('"', '\\"')
-        dsh_cmd = f'cd /d "{_DSH_DIR}" && pnpm dsh --profile headless "{task_escaped}"'
+        dsh_cmd = f'cd /d "{_DSH_DIR}" && pnpm dsh --profile headless --json "{task_escaped}"'
 
         sys.stderr.write(f"[TRACE] 下发任务: {benign_task[:100]}...\n")
 
-        # 执行任务（超时时间 = wait_seconds + 60s 缓冲）
+        # 执行任务并捕获 stdout 和退出码（超时时间 = wait_seconds + 60s 缓冲）
         timeout_ms = (wait_seconds + 60) * 1000
-        result = self._run_cmd(dsh_cmd, timeout_ms=timeout_ms)
+        stdout, exit_code = self._run_cmd_with_exit_code(dsh_cmd, timeout_ms=timeout_ms)
 
-        sys.stderr.write(f"[TRACE] 任务执行完成，等待 {wait_seconds}s 后截图...\n")
-        time.sleep(wait_seconds)
+        # 解析 JSONL 事件流，判定投递状态
+        status = self._parse_delivery_status(stdout, exit_code)
 
-        # 截图存证
-        shot = self.session.computer.beta_take_screenshot()
-        png_bytes = shot.data
+        # 证据 = stdout JSONL 原文（UTF-8 编码）
+        evidence_bytes = stdout.encode('utf-8') if stdout else b''
 
-        sys.stderr.write(f"[TRACE] 截图完成 ({len(png_bytes)} bytes)\n")
-        return png_bytes
+        sys.stderr.write(f"[TRACE] 投递校验结果: {status}（退出码={exit_code}）\n")
+        return evidence_bytes, status
+
+    def _run_cmd_with_exit_code(self, cmd: str, timeout_ms: int = 60000) -> tuple[str, int]:
+        """执行命令并返回 (stdout, exit_code)。
+
+        用于需要退出码的场景（dispatch 的投递校验）。
+        退出码从 SDK 返回对象的 exit_code / returncode / code 字段读取；
+        若都取不到，保守返回 0（但会由事件流校验兜底，不会假 PASS）。
+        """
+        try:
+            r = self.session.command.execute_command(cmd, timeout_ms=timeout_ms)
+            output = getattr(r, "output", "") or ""
+            # 退出码可能在 exit_code、returncode、code 等字段（SDK 版本差异）
+            exit_code = getattr(r, "exit_code", None)
+            if exit_code is None:
+                exit_code = getattr(r, "returncode", None)
+            if exit_code is None:
+                exit_code = getattr(r, "code", None)
+            if exit_code is None:
+                # 取不到退出码时保守返回 0，但 _parse_delivery_status 会用事件流二次校验
+                sys.stderr.write(f"[TRACE] ⚠ 取不到退出码，保守假设为 0: {cmd}\n")
+                exit_code = 0
+
+            return output, int(exit_code)
+        except Exception as e:
+            sys.stderr.write(f"[TRACE] ⚠ 命令异常: {cmd} -> {e}\n")
+            # 异常时返回空输出和 -1（会被判为 ERROR_STATE 或 NOT_DELIVERED）
+            return "", -1
+
+    def _parse_delivery_status(self, stdout: str, exit_code: int) -> str:
+        """解析 JSONL 事件流，判定投递状态。
+
+        判定逻辑（铁律：判不了/没跑起来绝不返回 OK，宁可 NOT_DELIVERED）：
+          1. 退出码非 0/1 → "ERROR_STATE"（异常崩溃、信号终止等）
+          2. 无 stdout 或无有效 JSON 事件 → "NOT_DELIVERED"（进程未启动、build 没做、启动即崩）
+          3. 有 run 事件（session/status/text/tool_call/tool_result/thinking/final 任一）
+             且退出码 0 或 1 → "OK"（任务确实跑起来了）
+          4. 有事件但全是 error 类型 → "ERROR_STATE"（起来了但明显是环境错误）
+          5. 有事件但无 run 事件（理论上不该出现，兜底）→ "NOT_DELIVERED"
+        """
+        # 1. 退出码异常
+        if exit_code not in (0, 1):
+            sys.stderr.write(f"[TRACE] 退出码异常: {exit_code}\n")
+            return "ERROR_STATE"
+
+        # 2. 无 stdout
+        if not stdout or not stdout.strip():
+            sys.stderr.write("[TRACE] 无 stdout 输出\n")
+            return "NOT_DELIVERED"
+
+        # 3. 解析 JSONL，统计事件类型
+        # run 事件：任务确实执行的信号（来自 json-stream.ts:259-316）
+        run_event_types = {"session", "status", "text", "tool_call", "tool_result", "thinking", "final"}
+        error_event_types = {"error"}
+
+        has_run_event = False
+        has_error_event = False
+        event_count = 0
+
+        for line in stdout.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                event = json.loads(line)
+                event_type = event.get("type", "")
+                event_count += 1
+
+                if event_type in run_event_types:
+                    has_run_event = True
+                if event_type in error_event_types:
+                    has_error_event = True
+            except json.JSONDecodeError:
+                # 非 JSON 行（如 pnpm 的提示信息），跳过
+                continue
+
+        # 4. 无任何有效事件
+        if event_count == 0:
+            sys.stderr.write("[TRACE] 无有效 JSON 事件\n")
+            return "NOT_DELIVERED"
+
+        # 5. 有 run 事件且退出码正常 → OK
+        if has_run_event:
+            return "OK"
+
+        # 6. 只有 error 事件或无 run 事件
+        if has_error_event:
+            sys.stderr.write(f"[TRACE] 仅有 error 事件，无 run 事件（共 {event_count} 个事件）\n")
+            return "ERROR_STATE"
+
+        # 7. 有事件但无 run 事件（兜底）
+        sys.stderr.write(f"[TRACE] 有 {event_count} 个事件但无 run 事件\n")
+        return "NOT_DELIVERED"
 
     def _run_cmd(self, cmd: str, timeout_ms: int = 60000, ignore_error: bool = False) -> str:
         """执行命令并返回输出。"""
