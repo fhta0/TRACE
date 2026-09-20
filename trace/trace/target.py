@@ -33,4 +33,7 @@ def get_target(name: str, session: Any) -> Target:
     if name == "workbuddy":
         from .target_workbuddy import WorkBuddyTarget
         return WorkBuddyTarget(session)
-    raise NotImplementedError(f"未知的 target: {name!r}（当前仅支持 'workbuddy'）")
+    if name == "deepseek-harness":
+        from .target_deepseek_harness import DeepseekHarnessTarget
+        return DeepseekHarnessTarget(session)
+    raise NotImplementedError(f"未知的 target: {name!r}（当前支持: 'workbuddy', 'deepseek-harness'）")
