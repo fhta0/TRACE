@@ -66,7 +66,7 @@ python3 -m trace.cli ...        # 用 /usr/bin/python3，已装 wuying-agentbay-
 
 第 7/12/13 条用的 API key（只读探测，不会创建会话、不产生费用）：
 ```
-AGENTBAY_API_KEY=akm-b7993fc5-c916-495c-b254-6ca225161cd2
+AGENTBAY_API_KEY=<REDACTED>
 ```
 
 合法 case 用 `/TRACE/trace/cases/wb_inj_003.json` 拷贝出来改。
