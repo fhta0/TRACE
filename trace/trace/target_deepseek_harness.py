@@ -31,6 +31,11 @@ _NODE_VERSION = "22.13.0"
 # deepseek-harness 代理执行任务后的输出文件（用于验证任务是否完成）
 _DSH_OUTPUT_DIR = "C:\\Users\\administrator\\dsh-output"
 
+# 批处理铁律：安装 bat 与轮询 bat 必须分开（cmd 逐行从磁盘读 bat，
+# 若轮询覆写同一文件会把正在跑的脚本读串）
+_INSTALL_BAT = r"C:\Users\Public\_dsh_install.bat"
+_POLL_BAT = r"C:\Users\Public\_dsh_poll.bat"
+
 
 class DeepseekHarnessTarget(Target):
     """DeepSeek Harness 代理的驱动适配器。"""
@@ -38,6 +43,85 @@ class DeepseekHarnessTarget(Target):
     def __init__(self, session: Any):
         super().__init__(session)
         self._dsh_ready = False
+
+    def _run_long_cmd(self, cmd: str, flag_name: str, timeout_s: int, poll_interval_s: int = 10) -> None:
+        """后台跑长命令 + 轮询 flag 文件，直到 DONE/FAIL 或超时。
+
+        Args:
+            cmd: 要执行的命令（裸批处理语法，不要套 cmd /c "..."）
+            flag_name: flag 文件名（不含路径），用于区分不同长命令
+            timeout_s: 超时秒数
+            poll_interval_s: 轮询间隔秒数
+
+        铁律：
+          - 每步失败即抛异常，绝不吞错
+          - 安装 bat（_INSTALL_BAT）与轮询 bat（_POLL_BAT）用不同文件路径
+          - 每个长命令用不同的 flag 文件名，避免串台
+          - 裸批处理语法，不要套 cmd /c "..."
+
+        流程：
+          1. 写安装 bat：清旧 flag + 跑命令 + 按退出码打 flag（DONE 或 FAIL:<code>）
+          2. 用 start /B 后台启动安装 bat
+          3. 轮询 flag 文件，直到出现 DONE/FAIL 或超时
+        """
+        flag_path = rf"C:\Users\Public\{flag_name}"
+
+        # 1) 写安装 bat
+        bat_body = f"""@echo off
+chcp 65001 >nul
+if exist "{flag_path}" del /f /q "{flag_path}"
+{cmd}
+if %ERRORLEVEL% NEQ 0 (
+    echo FAIL:%ERRORLEVEL%> "{flag_path}"
+    exit /b %ERRORLEVEL%
+)
+echo DONE> "{flag_path}"
+"""
+        w = self.session.filesystem.write_file(_INSTALL_BAT, bat_body)
+        if not getattr(w, "success", True):
+            raise RuntimeError(f"写入安装 bat 失败：path={_INSTALL_BAT!r} result={w!r}")
+
+        # 2) 后台启动安装 bat（start /B 返回 success=False 是常态，不判成败）
+        start_cmd = f'start "" /B cmd /c "{_INSTALL_BAT}"'
+        self.session.command.execute_command(start_cmd, timeout_ms=30000)
+
+        # 3) 轮询 flag 文件
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            # 用轮询 bat 检查 flag 文件
+            check_body = f'if exist "{flag_path}" (type "{flag_path}") else (echo PENDING)'
+            check_bat_content = f"@echo off\nchcp 65001 >nul\n{check_body}\n"
+            w = self.session.filesystem.write_file(_POLL_BAT, check_bat_content)
+            if not getattr(w, "success", True):
+                raise RuntimeError(f"写入轮询 bat 失败：path={_POLL_BAT!r} result={w!r}")
+
+            try:
+                r = self.session.command.execute_command(
+                    f'cmd /c "{_POLL_BAT}"', timeout_ms=30000
+                )
+                output = (getattr(r, "output", "") or "").strip()
+            except Exception as e:
+                # 单次轮询失败不算命令失败，继续轮询
+                sys.stderr.write(f"[TRACE] 轮询异常（继续）: {e}\n")
+                time.sleep(poll_interval_s)
+                continue
+
+            if "DONE" in output:
+                sys.stderr.write(f"[TRACE] 长命令完成: {cmd[:80]}...\n")
+                return
+            if output.startswith("FAIL:"):
+                exit_code = output.split(":", 1)[1]
+                raise RuntimeError(
+                    f"长命令失败：exit_code={exit_code}, cmd={cmd!r}"
+                )
+
+            time.sleep(poll_interval_s)
+
+        # 超时
+        raise RuntimeError(
+            f"长命令超时（{timeout_s}s）: {cmd!r}。"
+            f"flag 文件 {flag_path} 未出现 DONE/FAIL。"
+        )
 
     def provision(self) -> None:
         """在会话内安装 nvm-windows、Node.js、pnpm、deepseek-harness。"""
@@ -94,8 +178,12 @@ class DeepseekHarnessTarget(Target):
 
     def _install_node(self) -> None:
         """通过 nvm 安装 Node.js。"""
-        # 使用 nvm 安装 Node.js
-        self._run_cmd(f'nvm install {_NODE_VERSION}', timeout_ms=300000)
+        # nvm install 可能很慢，改用后台+轮询
+        self._run_long_cmd(
+            f'nvm install {_NODE_VERSION}',
+            flag_name='_dsh_nvm_install.flag',
+            timeout_s=600  # 10 分钟
+        )
         self._run_cmd(f'nvm use {_NODE_VERSION}')
 
         # 验证安装
@@ -104,7 +192,12 @@ class DeepseekHarnessTarget(Target):
 
     def _install_pnpm(self) -> None:
         """安装 pnpm。"""
-        self._run_cmd("npm install -g pnpm", timeout_ms=120000)
+        # npm install -g 可能很慢，改用后台+轮询
+        self._run_long_cmd(
+            'npm install -g pnpm',
+            flag_name='_dsh_pnpm_install.flag',
+            timeout_s=300  # 5 分钟
+        )
         result = self._run_cmd("pnpm --version")
         sys.stderr.write(f"[TRACE] pnpm 版本: {result.strip()}\n")
 
@@ -116,17 +209,29 @@ class DeepseekHarnessTarget(Target):
             sys.stderr.write("[TRACE] deepseek-harness 已克隆，跳过。\n")
             return
 
-        # 克隆仓库
+        # git clone 大仓库很慢，改用后台+轮询
         clone_cmd = f'git clone https://github.com/deepseek-ai/deepseek-harness.git "{_DSH_DIR}"'
-        self._run_cmd(clone_cmd, timeout_ms=300000)
+        self._run_long_cmd(
+            clone_cmd,
+            flag_name='_dsh_clone.flag',
+            timeout_s=600  # 10 分钟
+        )
 
     def _build_dsh(self) -> None:
         """构建 deepseek-harness。"""
-        # pnpm install
-        self._run_cmd(f'cd /d "{_DSH_DIR}" && pnpm install', timeout_ms=600000)
+        # pnpm install 很慢，改用后台+轮询
+        self._run_long_cmd(
+            f'cd /d "{_DSH_DIR}" && pnpm install',
+            flag_name='_dsh_pnpm_install_deps.flag',
+            timeout_s=900  # 15 分钟
+        )
 
-        # pnpm run build
-        self._run_cmd(f'cd /d "{_DSH_DIR}" && pnpm run build', timeout_ms=600000)
+        # pnpm run build 很慢，改用后台+轮询
+        self._run_long_cmd(
+            f'cd /d "{_DSH_DIR}" && pnpm run build',
+            flag_name='_dsh_build.flag',
+            timeout_s=600  # 10 分钟
+        )
 
     def plant_doc(self, filename: str, content: str) -> str:
         """把注入文档投放到 deepseek-harness 的工作目录。
