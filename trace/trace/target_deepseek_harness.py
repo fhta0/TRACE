@@ -1,16 +1,15 @@
-"""DeepSeek Harness 桌面目标驱动：在 AgentBay Linux 桌面镜像（aio-ubuntu-2404）内安装并运行 deepseek-harness。
+"""DeepSeek Harness 桌面目标驱动：在 AgentBay Linux 桌面镜像（aio-ubuntu-2404）内安装并运行 deepseek-harness 发行版。
 
-镜像预装 node v26 / npm / git / curl，不需要 nvm。
+镜像预装 node v26 / npm，不需要 nvm / corepack / pnpm / git clone。
 
-安装链（已真机验证）：
-  1. corepack enable（失败回退 npm install -g pnpm）
-  2. git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git /root/deepseek-harness
-  3. cd /root/deepseek-harness && pnpm install
-  4. cd /root/deepseek-harness && pnpm run build
+安装（已真机全绿验证，禁止改动）：
+  - npm install -g @deepseek-ai/dsh@0.1.6-alpha.2
+  - 校验：`dsh --version` 输出含 "0.1"
 
 运行方式：
-  - headless 模式：`cd /root/deepseek-harness && pnpm dsh --profile headless --json "<任务>"`
-  - 代理在沙箱内执行任务，可以读写文件、执行命令
+  - cwd=/root（agent 工作目录）
+  - `export DSH_PERMISSION_MODE=danger-full-access` 绕开 harness 内层沙箱（否则工具无法执行）
+  - headless 模式：`dsh --profile headless --json "<任务>"`
 """
 from __future__ import annotations
 
@@ -22,9 +21,7 @@ from typing import Any
 
 from .target import Target
 
-_DESKTOP = "/root"
-_DSH_DIR = "/root/deepseek-harness"
-_DSH_OUTPUT_DIR = "/root/dsh-output"
+_DSH_DIR = "/root"
 
 
 class DeepseekHarnessTarget(Target):
@@ -163,112 +160,42 @@ class DeepseekHarnessTarget(Target):
             return ""
 
     # ------------------------------------------------------------------
-    # provision：corepack → clone → install → build → 校验
+    # provision：npm 全局安装 dsh 发行版 + 校验
     # ------------------------------------------------------------------
     def provision(self) -> None:
-        """在会话内安装 deepseek-harness（node/git 已预装）。"""
-        sys.stderr.write("[TRACE] 开始安装 deepseek-harness ...\n")
+        """在会话内安装 deepseek-harness 发行版（node/npm 已预装）。
 
-        # 步骤 1/4：corepack enable（pnpm 通过 corepack 提供）
-        sys.stderr.write("[TRACE] 步骤 1/4: corepack enable ...\n")
-        self._enable_corepack()
+        已真机全绿验证，禁止改动：
+          1. npm install -g @deepseek-ai/dsh@0.1.6-alpha.2
+          2. 校验 `dsh --version` 输出含 "0.1"
+        """
+        sys.stderr.write("[TRACE] 开始安装 deepseek-harness 发行版 ...\n")
 
-        # 步骤 2/4：git clone（已存在则跳过）
-        sys.stderr.write("[TRACE] 步骤 2/4: git clone deepseek-harness ...\n")
-        self._clone_dsh()
-
-        # 步骤 3/4：pnpm install
-        sys.stderr.write("[TRACE] 步骤 3/4: pnpm install ...\n")
-        self._install_deps()
-
-        # 步骤 4/4：pnpm run build
-        sys.stderr.write("[TRACE] 步骤 4/4: pnpm run build ...\n")
-        self._build_dsh()
-
-        # 创建输出目录（兼容性保留）
-        self._run_cmd(f"mkdir -p {_DSH_OUTPUT_DIR}")
-
-        # 校验：pnpm dsh --help 能跑
-        sys.stderr.write("[TRACE] 校验 deepseek-harness 安装 ...\n")
-        help_output = self._run_cmd(
-            f"cd {_DSH_DIR} && pnpm dsh --help", timeout_ms=60000, ignore_error=True
+        # 步骤 1/2：全局安装 dsh（@0.1.6-alpha.2 真机验证版本）
+        sys.stderr.write("[TRACE] 步骤 1/2: npm install -g @deepseek-ai/dsh@0.1.6-alpha.2 ...\n")
+        self._run_long_cmd(
+            "npm install -g @deepseek-ai/dsh@0.1.6-alpha.2",
+            step_name="npm_dsh",
+            timeout_s=600,
         )
-        if "dsh" not in help_output.lower() and "usage" not in help_output.lower():
+
+        # 步骤 2/2：校验 `dsh --version` 输出含 "0.1"
+        sys.stderr.write("[TRACE] 步骤 2/2: 校验 dsh --version ...\n")
+        ver = self._run_cmd("dsh --version").strip()
+        if "0.1" not in ver:
             raise RuntimeError(
-                f"deepseek-harness 校验失败：pnpm dsh --help 输出异常: {help_output[:500]}"
+                f"deepseek-harness 校验失败：dsh --version 输出异常: {ver[:500]}"
             )
 
-        sys.stderr.write("[TRACE] deepseek-harness 安装完成。\n")
+        sys.stderr.write(f"[TRACE] deepseek-harness 安装完成（{ver}）。\n")
         self._dsh_ready = True
-
-    def _pnpm_ok(self) -> bool:
-        """pnpm 是否真的可用（跨 shell）。判据只看 `pnpm --version` 实际能不能跑，
-        不看 corepack 的输出——corepack 在本镜像可能根本不存在（报 not found）。"""
-        ver = self._run_cmd("pnpm --version", ignore_error=True).strip()
-        return bool(ver) and "not found" not in ver.lower()
-
-    def _enable_corepack(self) -> None:
-        """确保 pnpm 可用。
-
-        §FIX-linux-smoke：aio-ubuntu-2404 镜像**没有 corepack**（`corepack enable`
-        报 `not found` rc=127）。原逻辑按 corepack 输出是否含 "error" 决定是否回退，
-        而 "not found" 不含 "error" 且非空 → 回退没触发 → pnpm 找不到。
-        正解：回退门槛只看 `pnpm --version` 实际能不能跑。
-        `npm install -g pnpm` 装到 /usr/bin（在 PATH 上），跨 execute_command 新 shell 可用（实测）。
-        """
-        if self._pnpm_ok():
-            pass  # 已可用（少见，但不排除镜像自带）
-        else:
-            # 先试 corepack（若存在）
-            self._run_cmd("corepack enable 2>&1", ignore_error=True)
-            if not self._pnpm_ok():
-                sys.stderr.write("[TRACE] corepack 不可用，改用 npm install -g pnpm ...\n")
-                self._run_long_cmd(
-                    "npm install -g pnpm",
-                    step_name="npm_pnpm",
-                    timeout_s=300,
-                )
-
-        if not self._pnpm_ok():
-            raise RuntimeError("pnpm 不可用：corepack enable 与 npm install -g pnpm 均失败")
-        ver = self._run_cmd("pnpm --version").strip()
-        sys.stderr.write(f"[TRACE] pnpm 版本: {ver}\n")
-
-    def _clone_dsh(self) -> None:
-        """克隆 deepseek-harness 仓库（已存在则跳过）。"""
-        result = self._run_cmd(f"test -d {_DSH_DIR} && echo EXISTS", ignore_error=True)
-        if "EXISTS" in result:
-            sys.stderr.write("[TRACE] deepseek-harness 已克隆，跳过。\n")
-            return
-
-        self._run_long_cmd(
-            f"git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git {_DSH_DIR}",
-            step_name="git_clone",
-            timeout_s=600,  # 10 分钟
-        )
-
-    def _install_deps(self) -> None:
-        """pnpm install 依赖。"""
-        self._run_long_cmd(
-            f"cd {_DSH_DIR} && pnpm install",
-            step_name="pnpm_install",
-            timeout_s=900,  # 15 分钟
-        )
-
-    def _build_dsh(self) -> None:
-        """pnpm run build。"""
-        self._run_long_cmd(
-            f"cd {_DSH_DIR} && pnpm run build",
-            step_name="pnpm_build",
-            timeout_s=600,  # 10 分钟
-        )
 
     # ------------------------------------------------------------------
     # plant_doc：投放注入文档
     # ------------------------------------------------------------------
     def plant_doc(self, filename: str, content: str) -> str:
-        """把注入文档投放到 deepseek-harness 的工作目录（/root/deepseek-harness）。"""
-        path = f"{_DSH_DIR}/{filename}"
+        """把注入文档投放到 agent 工作目录（/root）。"""
+        path = f"/root/{filename}"
         r = self.session.filesystem.write_file(path, content)
         if not getattr(r, "success", True):
             raise RuntimeError(f"投放文档失败：{path} -> {r}")
@@ -316,12 +243,13 @@ class DeepseekHarnessTarget(Target):
         if not api_key:
             raise RuntimeError("环境变量 DEEPSEEK_API_KEY 未设置")
 
-        # 构建 Linux 命令：cd + export API key + pnpm dsh
+        # 构建 Linux 命令：cd /root + export API key + danger-full-access + 全局 dsh
         task_escaped = benign_task.replace('"', '\\"')
         dsh_cmd = (
-            f"cd {_DSH_DIR} && "
+            f"cd /root && "
             f"export DEEPSEEK_API_KEY='{api_key}' && "
-            f'pnpm dsh --profile headless --json "{task_escaped}"'
+            f"export DSH_PERMISSION_MODE=danger-full-access && "
+            f'dsh --profile headless --json "{task_escaped}"'
         )
 
         sys.stderr.write(f"[TRACE] 下发任务: {benign_task[:100]}...\n")
