@@ -201,24 +201,38 @@ class DeepseekHarnessTarget(Target):
         sys.stderr.write("[TRACE] deepseek-harness 安装完成。\n")
         self._dsh_ready = True
 
-    def _enable_corepack(self) -> None:
-        """启用 corepack（失败则回退 npm install -g pnpm）。"""
-        result = self._run_cmd("corepack enable", ignore_error=True)
-        if "error" in result.lower() or not result.strip():
-            sys.stderr.write(
-                "[TRACE] corepack enable 失败或无输出，回退到 npm install -g pnpm\n"
-            )
-            self._run_long_cmd(
-                "npm install -g pnpm",
-                step_name="npm_pnpm_fallback",
-                timeout_s=300,
-            )
+    def _pnpm_ok(self) -> bool:
+        """pnpm 是否真的可用（跨 shell）。判据只看 `pnpm --version` 实际能不能跑，
+        不看 corepack 的输出——corepack 在本镜像可能根本不存在（报 not found）。"""
+        ver = self._run_cmd("pnpm --version", ignore_error=True).strip()
+        return bool(ver) and "not found" not in ver.lower()
 
-        # 验证 pnpm 可用
-        ver = self._run_cmd("pnpm --version")
-        sys.stderr.write(f"[TRACE] pnpm 版本: {ver.strip()}\n")
-        if not ver.strip():
-            raise RuntimeError("pnpm 不可用，corepack enable 和 npm install -g pnpm 均失败")
+    def _enable_corepack(self) -> None:
+        """确保 pnpm 可用。
+
+        §FIX-linux-smoke：aio-ubuntu-2404 镜像**没有 corepack**（`corepack enable`
+        报 `not found` rc=127）。原逻辑按 corepack 输出是否含 "error" 决定是否回退，
+        而 "not found" 不含 "error" 且非空 → 回退没触发 → pnpm 找不到。
+        正解：回退门槛只看 `pnpm --version` 实际能不能跑。
+        `npm install -g pnpm` 装到 /usr/bin（在 PATH 上），跨 execute_command 新 shell 可用（实测）。
+        """
+        if self._pnpm_ok():
+            pass  # 已可用（少见，但不排除镜像自带）
+        else:
+            # 先试 corepack（若存在）
+            self._run_cmd("corepack enable 2>&1", ignore_error=True)
+            if not self._pnpm_ok():
+                sys.stderr.write("[TRACE] corepack 不可用，改用 npm install -g pnpm ...\n")
+                self._run_long_cmd(
+                    "npm install -g pnpm",
+                    step_name="npm_pnpm",
+                    timeout_s=300,
+                )
+
+        if not self._pnpm_ok():
+            raise RuntimeError("pnpm 不可用：corepack enable 与 npm install -g pnpm 均失败")
+        ver = self._run_cmd("pnpm --version").strip()
+        sys.stderr.write(f"[TRACE] pnpm 版本: {ver}\n")
 
     def _clone_dsh(self) -> None:
         """克隆 deepseek-harness 仓库（已存在则跳过）。"""
@@ -292,8 +306,10 @@ class DeepseekHarnessTarget(Target):
           - evidence_bytes: stdout JSONL 事件流原文（UTF-8 编码），runner 当证据存文件
           - status: "OK" | "NOT_DELIVERED" | "ERROR_STATE"
         """
-        if not self._dsh_ready:
-            raise RuntimeError("deepseek-harness 未就绪，请先运行 provision")
+        # §FIX-linux-smoke：不要用 self._dsh_ready 这种实例标志做就绪门槛——
+        # provision 和 run 是**两次独立的 CLI 调用（不同进程、不同 Target 实例）**，
+        # provision 里设的 _dsh_ready=True 不会带到 run 的新实例。就绪与否交给
+        # 投递校验兜底：dsh 没装好 → 无 run 事件 → NOT_DELIVERED（不会假 PASS）。
 
         # 设置 API key（从环境变量读取，避免硬编码）
         api_key = os.environ.get("DEEPSEEK_API_KEY", "")
