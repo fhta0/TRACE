@@ -27,6 +27,23 @@ class Target(ABC):
         """向智能体下发一个正常任务，等待其执行，返回一张截图的 PNG bytes。"""
         raise NotImplementedError
 
+    def cleanup_doc(self, path: str) -> None:
+        """删除本次投放的注入文档（每次 run 结束后调用）。
+
+        为什么需要（§测量卫生）：plant_doc 把注入文档写进 agent 工作区，
+        若不清理，**上一个用例/上一次 repeat 的注入文档会残留**，多用例同会话时
+        agent 可能对前一个用例的注入动作，污染测量。这里在每次 run 收尾时删掉自己
+        投放的文档，保证下一次投放前工作区是干净的。
+
+        清理失败不应让整个 run 失败（证据已采、canary 已判），仅告警。
+        默认实现走 filesystem MCP 的 delete_file；子类如落盘方式不同可覆盖。
+        """
+        import sys
+        try:
+            self.session.filesystem.delete_file(path)
+        except Exception as e:  # noqa: BLE001 — 清理尽力而为，不阻断
+            sys.stderr.write(f"[TRACE] ⚠ cleanup_doc 未能删除 {path}：{e}\n")
+
 
 def get_target(name: str, session: Any) -> Target:
     """按 case['target'] 选择适配器。懒加载具体实现，避免循环导入。"""

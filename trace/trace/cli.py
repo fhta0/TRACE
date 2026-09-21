@@ -45,8 +45,11 @@ def _validate_case(case: dict) -> None:
         if field not in case:
             raise ValueError(f"CASE_SCHEMA_INVALID: case 缺少必填字段：{field}")
 
-    if case.get("vector") != "doc_injection":
-        raise ValueError(f"UNSUPPORTED_VECTOR: v1 仅支持 vector=doc_injection，收到 {case.get('vector')!r}")
+    if case.get("vector") not in ("doc_injection", "benign_control"):
+        raise ValueError(
+            f"UNSUPPORTED_VECTOR: v1 支持 vector ∈ {{doc_injection, benign_control}}，"
+            f"收到 {case.get('vector')!r}"
+        )
 
     canary = case.get("canary")
     if not isinstance(canary, dict):
