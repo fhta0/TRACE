@@ -358,13 +358,19 @@ class DeepseekHarnessTarget(Target):
     def _parse_delivery_status(self, stdout: str, exit_code: int) -> str:
         """解析 JSONL 事件流，判定投递状态。
 
-        判定逻辑（铁律：判不了/没跑起来绝不返回 OK，宁可 NOT_DELIVERED）：
+        判定逻辑（铁律：判不了/没跑起来/报错收场绝不返回 OK，宁可 ERROR_STATE）：
           1. 退出码非 0/1 → "ERROR_STATE"（异常崩溃、信号终止等）
           2. 无 stdout 或无有效 JSON 事件 → "NOT_DELIVERED"（进程未启动、build 没做、启动即崩）
-          3. 有 run 事件（session/status/text/tool_call/tool_result/thinking/final 任一）
+          3. turn 以 error 收场（type=="status" 且 phase=="turn_end" 且 reason.kind=="error"），
+             或有顶层 error 事件 → "ERROR_STATE"
+             （环境/agent 没干净跑完 = 没测到，不是 OK，跟 WorkBuddy 的 ERROR_STATE 同理）
+          4. 有 run 事件（session/status/text/tool_call/tool_result/thinking/final 任一）
              且退出码 0 或 1 → "OK"（任务确实跑起来了）
-          4. 有事件但全是 error 类型 → "ERROR_STATE"（起来了但明显是环境错误）
           5. 有事件但无 run 事件（理论上不该出现，兜底）→ "NOT_DELIVERED"
+
+        关键：步骤 3 必须在步骤 4 之前。turn_end with reason.kind=="error" 的信号
+        藏在 status 事件里（来自 json-stream.ts），仅看 type=="status" 会被误判为 run 事件；
+        必须先查 turn 是否报错，再判 has_run_event→OK，否则错误收场会变成空 PASS。
         """
         # 1. 退出码异常
         if exit_code not in (0, 1):
@@ -386,6 +392,7 @@ class DeepseekHarnessTarget(Target):
 
         has_run_event = False
         has_error_event = False
+        turn_errored = False
         event_count = 0
 
         for line in stdout.strip().split("\n"):
@@ -402,6 +409,14 @@ class DeepseekHarnessTarget(Target):
                     has_run_event = True
                 if event_type in error_event_types:
                     has_error_event = True
+                # turn 以 error 收场：phase=="turn_end" 且 reason.kind=="error"
+                # （正常收场是 reason.kind=="completed"，不算 error）
+                if (
+                    event_type == "status"
+                    and event.get("phase") == "turn_end"
+                    and event.get("reason", {}).get("kind") == "error"
+                ):
+                    turn_errored = True
             except json.JSONDecodeError:
                 # 非 JSON 行（如 pnpm 的提示信息），跳过
                 continue
@@ -411,16 +426,18 @@ class DeepseekHarnessTarget(Target):
             sys.stderr.write("[TRACE] 无有效 JSON 事件\n")
             return "NOT_DELIVERED"
 
-        # 5. 有 run 事件且退出码正常 → OK
-        if has_run_event:
-            return "OK"
-
-        # 6. 只有 error 事件或无 run 事件
-        if has_error_event:
+        # 5. turn 报错 或 有顶层 error 事件 → ERROR_STATE
+        #    必须排在 has_run_event→OK 之前，否则错误收场会误判为 OK
+        if turn_errored or has_error_event:
             sys.stderr.write(
-                f"[TRACE] 仅有 error 事件，无 run 事件（共 {event_count} 个事件）\n"
+                f"[TRACE] 错误收场：turn_errored={turn_errored}, "
+                f"has_error_event={has_error_event}（共 {event_count} 个事件）\n"
             )
             return "ERROR_STATE"
+
+        # 6. 有 run 事件且退出码正常 → OK
+        if has_run_event:
+            return "OK"
 
         # 7. 有事件但无 run 事件（兜底）
         sys.stderr.write(f"[TRACE] 有 {event_count} 个事件但无 run 事件\n")
