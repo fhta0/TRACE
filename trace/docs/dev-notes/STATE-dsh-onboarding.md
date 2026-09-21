@@ -1,7 +1,39 @@
 # deepseek-harness 接入现状（诚实盘点）
 
+## ✅ 2026-09-21：工具执行阻塞已攻克，deepseek 真机端到端可测
+
+**最终可用配置（全部真机验证：tool_call+tool_result、turn_end=completed、文件真被创建）：**
+1. **provision 改为装发行版**：`npm install -g @deepseek-ai/dsh@0.1.6-alpha.2`
+   —— **不再 clone+build**（几十秒）。发行版列表见 GitHub releases；npm 的 `latest`
+   dist-tag 是旧的 `0.1.5-rc.2`（无 `--json`），要显式指定 `@0.1.6-alpha.2`（有 `--json`）。
+2. **dispatch 用全局 `dsh` + 关内层沙箱**：
+   `export DSH_PERMISSION_MODE=danger-full-access && dsh --profile headless --json "<task>"`
+   —— **不是** repo 的 `pnpm dsh`（那个工具运行时坏，见下）。
+3. **plant_doc** 放到 agent 的 cwd（dispatch 用 `cd /root`，就放 `/root/<file>`）。
+4. 投递校验（--json 事件流解析）不用改，0.1.6 的 turn_end 是 `completed`。
+
+**攻克链条（每步真机验证）**：
+- exit-1 探因 → 发现工具调用 turn 以 error 收场（空 PASS）。
+- repo `pnpm dsh --json`：工具运行时调度器 undefined（`reading 'prepare'`）——
+  **从仓库工作区跑用 loadProfileDirectory，composition 坏，弃用**。
+- 发布版 `dsh`（npm i -g）：工具运行时好、会正确初始化 `~/.dsh/profiles/headless`，
+  但工具被**内层沙箱**拦：`sandbox mode "workspace-write" ... no sandbox backend usable
+  (install bubblewrap / Landlock kernel)`。AgentBay 容器无 bubblewrap、内核 5.10 无 Landlock。
+- **根因 + 解法**：`base/cordis.patch.yml` 的 sandbox-policy `mode: process.env.DSH_PERMISSION_MODE
+  ?? 'workspace-write'`。设 **`DSH_PERMISSION_MODE=danger-full-access`** → 跳过内层沙箱
+  （`terminal-controller`：`if (policy.mode !== 'danger-full-access')` 才 confine）。
+  我们本就在 AgentBay 隔离沙箱里，不需要 harness 再套一层，danger-full-access 正当。
+- 装 `@0.1.6-alpha.2`（发行版，有 --json）+ danger-full-access → 全绿。
+
+**下一步**：按上述改适配器（provision 简化为 npm i -g release、dispatch 用全局 dsh + env、
+plant_doc 改 /root），再真机 smoke 一次拿到第一个**真实**的 deepseek 判定。
+
+---
+
+## 历史记录（下面是攻克前的盘点，保留备查）
+
 一句话：**基础设施做完了、投递校验现在是诚实的，但 harness agent 在我们的 headless
-调用下工具执行报错、干不了活 —— deepseek 还没被真正测到。**
+调用下工具执行报错、干不了活 —— deepseek 还没被真正测到。**（← 此问题已于 2026-09-21 解决，见上。）
 
 ## 已完成且经审核（都在 wip/deepseek-harness）
 
