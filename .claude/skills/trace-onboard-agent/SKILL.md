@@ -59,7 +59,7 @@ trace/
 
 ```bash
 export AGENTBAY_API_KEY=<key>
-python3 -m trace.cli session create --json
+python3 -m trace.cli session create --target <target名> --json
 # stdout: {"session_id": "s-xxxx", "screen": {...}, "desktop_url": "...", "stable": true}
 ```
 
@@ -68,8 +68,12 @@ python3 -m trace.cli session create --json
 > ⚠️ 命令会醒目提示"持续计费"——**用完务必 `session rm` 收尾**，否则一直扣钱。
 > 这是整个流程最不能漏的一步，弱模型最容易忘。
 
+**镜像由 target 自己决定，不用你记。** 给 `--target`，CLI 就从该 target 的元数据声明里取镜像
+（如 deepseek-harness→`aio-ubuntu-2404`(Linux)、workbuddy→`windows_latest`）。用错 OS 时 provision
+会有守卫当场拦下。
+
 可选参数：
-- `--image <image_id>`：默认 `windows_latest`，特殊镜像按需指定
+- `--image <image_id>`：显式覆盖镜像（优先级：`--image` > `--target` 默认 > `windows_latest` 兜底）。一般不用给。
 - `--label <name>`：给会话打标签，便于 `session list` 时辨识
 
 命令会轮询等待屏幕参数稳定（实测启动早期会返回过渡值 1024x768，稳定后才是真实值 1920x1060）——直接拿过渡值去 calibrate 会把坐标标错。
@@ -147,6 +151,13 @@ _COORD_INPUT_BOX = (x2, y2)
 _COORD_SEND_BUTTON = (x3, y3)
 
 class NewAgentTarget(Target):
+    # ★ 四个必填元数据（Target 契约）：工具据此选镜像、校验 OS、定默认用例、显示名。
+    #   基类的 validate_meta() 会强制你声明；不填就报错。
+    IMAGE_ID = "windows_latest"          # 该智能体要的 AgentBay 镜像
+    OS = "windows"                       # "linux" | "windows"（provision OS 守卫据此校验）
+    DEFAULT_CASES = "cases/<你的目录>/"   # 该 target 的默认用例目录
+    DISPLAY_NAME = "New Agent (…)"       # 人读名
+
     def provision(self) -> None:
         from . import provision as _prov
         _prov.install(self.session, {
@@ -173,15 +184,23 @@ class NewAgentTarget(Target):
         return self.session.computer.beta_take_screenshot().data
 ```
 
-然后在 `trace/target.py` 的 `get_target()` 里注册一行：
+然后在 `trace/target.py` 的注册表 `_build_registry()` 里加一行：
 
 ```python
-if name == "<新agent名>":
-    from .target_<新agent> import NewAgentTarget
-    return NewAgentTarget(session)
+def _build_registry():
+    from .target_workbuddy import WorkBuddyTarget
+    from .target_deepseek_harness import DeepseekHarnessTarget
+    from .target_<新agent> import NewAgentTarget          # ← 加这行 import
+    return {
+        "workbuddy": WorkBuddyTarget,
+        "deepseek-harness": DeepseekHarnessTarget,
+        "<新agent名>": NewAgentTarget,                     # ← 和这行注册
+    }
 ```
 
-核心/判定/报告都不用动 —— 这就是接缝的意义。
+**接入新智能体 = 写这个适配器（4 个元数据 + provision/plant_doc/dispatch 三个钩子）+ 注册表加两行。**
+核心/判定/报告/CLI 都不用动 —— 判定层锁死、机制层开放，这就是接缝的意义。
+（headless CLI 类智能体可继承 `HeadlessCliTarget` 家族基类复用通用机制——若已抽出。）
 
 ### 第 6 步：冒烟验证
 
@@ -197,6 +216,29 @@ python3 -m trace.cli run --case cases/smoke.json --out r.json \
 - **canary 判定正常吗** —— 先用一个"一定会 CLEAN"的路径确认判定不会误报
 
 坐标标定是这一步最常见的返工来源。截图是你唯一的真相来源。
+
+## 运行评测：选用例、跑批、出汇总报告
+
+**契约：给 target 名即可。** 镜像/OS 从 target 元数据查表，用例默认用该 target 的 `DEFAULT_CASES`。
+
+```bash
+# 1. 看这个 target 有哪些用例（菜单：id / 标题 / 套件）
+python3 -m trace.cli cases list --target <target名>
+
+# 2. 跑：三选一的选择粒度
+python3 -m trace.cli run-batch --target <target名> \
+    --session s-xxxx --out-dir out/ --summary-report out/summary.html          # 全套
+python3 -m trace.cli run-batch --target <target名> --suite round-3 ...          # 只跑某套件
+python3 -m trace.cli run-batch --target <target名> --ids CASE-1,CASE-2 ...      # 按 id 选
+```
+
+- `--summary-report out/summary.html`：整批跑完**自动出一份自包含的汇总报告**（每用例双结论 + 破防率 + 总览计数，可离线打开）。
+- 单个用例仍可 `run --case <路径> --report r.html`。
+
+**参数优先级链**（每个参数都按这条走）：**用户显式提供 > target 默认 > 缺失时的处理**。缺失时分两种：
+- **交互式**（你在和用户对话）：缺 target 就**问用户**；缺用例就用 `cases list` 列菜单让用户挑。
+- **headless / 自动跑**（没有回头问的通道）：缺关键项**直接 fail-fast 报清楚**，别静默用错默认。
+- 已确定的东西（镜像/OS 由 target 决定）不必问，直接查表；用错 OS 有 provision 守卫兜底。
 
 ## 收尾：务必删会话
 

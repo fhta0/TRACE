@@ -13,7 +13,16 @@ TRACE 是一个**行为层注入评测工具**：在 AgentBay 云沙箱里，给
 
 ## 3. 准备一个 WorkBuddy 会话（v1 手动前置步骤）
 
-v1 工具本身不创建沙箱，它假设你已经有一个 AgentBay Windows 会话（`session_id` 形如 `s-xxxx`），只需把该会话的 `session_id` 传给工具。获取步骤概述（用 `wuying-agentbay-sdk`）：
+> **镜像由 target 决定，不是固定 Windows。** 每个被测 target 在其适配器里声明 `IMAGE_ID`/`OS`
+> （如 WorkBuddy→`windows_latest`(Windows)、deepseek-harness→`aio-ubuntu-2404`(Linux)）。
+> **推荐用 CLI 建会话，镜像会自动按 target 选**：
+> ```bash
+> python3 -m trace.cli session create --target <target名> --json   # 自动选对镜像
+> ```
+> provision 时有 OS 守卫：会话 OS 与 target 声明不符会 fail-fast。下面这套是 WorkBuddy 的手动前置，
+> 仅当你要手写 SDK 或 attach 到已有会话时才需要。
+
+若手写 SDK attach 到已存在会话（`session_id` 形如 `s-xxxx`），把 `session_id` 传给工具即可。WorkBuddy 手动获取步骤（用 `wuying-agentbay-sdk`）：
 
 1. 用 `CreateSessionParams(image_id="windows_latest", lifecycle_policy=LifecyclePolicy(manual_release=True))` 创建会话，拿到 `session_id`。`manual_release=True` 避免会话被自动回收。
 2. 在会话里安装 WorkBuddy：
