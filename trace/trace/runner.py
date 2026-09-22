@@ -34,19 +34,24 @@ def _system_protection(case: dict, has_fail: bool) -> str:
     return "NONE" if case.get("permission_mode") == "full_access" else "N/A"
 
 
-# --- canary 分发（v1 只有 file_exists）---
-def _canary_reset(case: dict, session: Any) -> None:
-    canary = case["canary"]
-    if canary["type"] != "file_exists":
-        raise NotImplementedError(f"v1 不支持 canary type: {canary['type']}")
-    oracle.reset(session, canary["path"])
+# --- canary 分发 ---
+# 两种 type 都是"某个具体路径的文件是否存在"：file_exists（旧，带绝对 path）
+# 与 marker_file（可移植，带 name，由 target.resolve_canary 按 OS 拼出路径）。
+# canary_path 由调用方（_run_once）经 target.resolve_canary 解析后传入——
+# 路径解析是机制，判定仍是 oracle 的确定性存在性检查（判定层不变）。
+_CANARY_TYPES = ("file_exists", "marker_file")
 
 
-def _canary_check(case: dict, session: Any) -> str:
-    canary = case["canary"]
-    if canary["type"] != "file_exists":
+def _canary_reset(canary: dict, session: Any, canary_path: str) -> None:
+    if canary["type"] not in _CANARY_TYPES:
         raise NotImplementedError(f"v1 不支持 canary type: {canary['type']}")
-    return oracle.check(session, canary["path"])
+    oracle.reset(session, canary_path)
+
+
+def _canary_check(canary: dict, session: Any, canary_path: str) -> str:
+    if canary["type"] not in _CANARY_TYPES:
+        raise NotImplementedError(f"v1 不支持 canary type: {canary['type']}")
+    return oracle.check(session, canary_path)
 
 
 # --- §FIX-calibration-v2：现场校准（每次评测前，不依赖存盘复用）---
@@ -120,11 +125,19 @@ def _run_once(
       校准必须在 plant_doc 之前完成——校准阶段屏幕上绝不能有注入 payload。
       calibration_result 参数仅作记录/审计用途，实际校准已在 run_case 应用。
     """
+    # canary 抽象化（Phase 2·Step 1）：把 canary 声明经 target 解析成具体路径
+    # （旧用例带绝对 path → 原样；可移植用例带 name → 按 target 的 OS 拼路径）。
+    canary_path = target.resolve_canary(case["canary"])
+
     # 每次 run 前先重置 canary（校准已在 run_case 完成）
-    _canary_reset(case, session)
+    _canary_reset(case["canary"], session, canary_path)
+
+    # 文档占位符替换：注入文本里的 {{canary_path}} 换成解析出的具体路径，
+    # 使"注入指向的文件"与"oracle 判定的文件"始终是同一个（跨 OS 一致）。
+    doc_content = case["doc_content"].replace("{{canary_path}}", canary_path)
 
     # 投放文档（注入 payload 第一次出现在屏幕上）
-    planted_path = target.plant_doc(case["doc_filename"], case["doc_content"])
+    planted_path = target.plant_doc(case["doc_filename"], doc_content)
 
     # §测量卫生：无论 dispatch/判定走哪条早返回或抛异常，收尾都要删掉本次投放的文档，
     # 避免残留污染下一个用例/下一次 repeat（见 Target.cleanup_doc）。
@@ -176,7 +189,7 @@ def _run_once(
             }
 
         # status == "OK"：判定 canary
-        canary_status = _canary_check(case, session)
+        canary_status = _canary_check(case["canary"], session, canary_path)
 
         return {
             "run": run_idx,

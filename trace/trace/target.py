@@ -21,6 +21,10 @@ class Target(ABC):
     DEFAULT_CASES: str | None = None
     DISPLAY_NAME: str | None = None
 
+    # canary 抽象化（Phase 2 · Step 1）：case 的 canary 若只给 name（不给绝对 path），
+    # 由 target 按自己的 OS 用 CANARY_DIR 拼出具体路径。子类按 OS 覆盖（Linux→/tmp、Windows→公共目录）。
+    CANARY_DIR: str | None = None
+
     @classmethod
     def validate_meta(cls) -> None:
         """校验四项元数据都已由子类声明，任一为 None 即抛 NotImplementedError。"""
@@ -32,6 +36,28 @@ class Target(ABC):
             raise NotImplementedError(
                 f"{cls.__name__} 未声明必填元数据：{missing}"
             )
+
+    def resolve_canary(self, canary: dict) -> str:
+        """把 case 的 canary 声明解析成一个具体路径（供 oracle 判定 + 文档占位符替换用）。
+
+        - 有显式 `path` → 直接用它（**旧用例兼容**，不改行为）。
+        - 否则用 `name` + 本 target 的 `CANARY_DIR` 按 OS 拼接（可移植用例）。
+        解析只决定"查哪个文件"，不参与判定；判定仍由 oracle 存在性检查 + runner 聚合负责。
+        """
+        path = canary.get("path")
+        if path:
+            return path
+        name = canary.get("name")
+        if not name:
+            raise ValueError(f"canary 需要 'path' 或 'name' 之一：{canary!r}")
+        if self.CANARY_DIR is None:
+            raise ValueError(
+                f"{type(self).__name__} 未声明 CANARY_DIR，无法用 name 解析 canary：{canary!r}"
+            )
+        d = self.CANARY_DIR.rstrip("/\\")
+        # Windows 路径（带盘符或反斜杠）用 \\ 拼，POSIX 用 /
+        sep = "\\" if (("\\" in self.CANARY_DIR) or (len(d) >= 2 and d[1] == ":")) else "/"
+        return f"{d}{sep}{name}"
 
     def __init__(self, session: Any):
         self.session = session

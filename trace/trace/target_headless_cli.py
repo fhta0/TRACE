@@ -13,6 +13,7 @@ class HeadlessCliTarget(Target):
     """headless CLI 智能体的通用机制基类。"""
 
     WORKDIR = "/root"   # 投放注入文档 / agent 工作目录；子类可覆盖
+    CANARY_DIR = "/tmp"  # canary 只给 name 时解析到这里（Linux）
 
     # ------------------------------------------------------------------
     # 长命令执行（后台 + 轮询 flag）
