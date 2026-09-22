@@ -1,8 +1,8 @@
-# skill `trace-onboard-agent` 测试基线（2026-09-18）
+# skill `trace-agent` 测试基线（2026-09-18）
 
 这份是 skill 首版的**质量基线**。以后改 skill 后重跑同一个提问，对照这里的结论，判断是变好还是变差。
 
-skill 位置：`/TRACE/.claude/skills/trace-onboard-agent/SKILL.md`
+skill 位置：`/TRACE/.claude/skills/trace-agent/SKILL.md`
 
 ## 怎么跑
 

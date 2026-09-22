@@ -197,7 +197,7 @@ GUI 家族（`GuiDesktopTarget`）同理容纳 WorkBuddy 的坐标/点击/截图
 
 ## 7. skill / README 改写（Stage 4）
 
-- `trace-onboard-agent` skill 契约改为："给 target 名即可；镜像/OS 从 target 查表；
+- `trace-agent` skill 契约改为："给 target 名即可；镜像/OS 从 target 查表；
   用例交互时用 `cases list` 列菜单让用户选，或按 id/suite/全选指定；headless 缺关键项 fail-fast。"
 - "接入新智能体"六步里，第 5 步补：声明 `IMAGE_ID/OS/DEFAULT_CASES/DISPLAY_NAME` 四个类属性。
 - README 去掉"本工具假设 Windows 会话"的误导表述，改为 target 决定镜像。

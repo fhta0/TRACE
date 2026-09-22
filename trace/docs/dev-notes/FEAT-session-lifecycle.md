@@ -82,7 +82,7 @@ python -m trace.cli session url <session_id>
 
 ## 同时更新 skill
 
-`.claude/skills/trace-onboard-agent/SKILL.md` 里现在教使用者**手写 Python 建会话**：
+`.claude/skills/trace-agent/SKILL.md` 里现在教使用者**手写 Python 建会话**：
 
 ```python
 from agentbay import AgentBay, CreateSessionParams, LifecyclePolicy
@@ -114,7 +114,7 @@ python -m trace.cli session rm s-xxxx            # 务必收尾
 ## 约束
 
 - 只改 `trace/cli.py`、`trace/provider.py`（如需）、`CONTRACT.md`、
-  以及 `.claude/skills/trace-onboard-agent/SKILL.md`。
+  以及 `.claude/skills/trace-agent/SKILL.md`。
 - **不改判定逻辑**：`runner.py` / `oracle.py` / `report.py` / `target_*.py` 一行不动。
 - 不引入三方依赖。不发网络、不真的创建会话（真机验证由协调方安排，
   且**必须由 ds 容器里的模型用这些命令自己跑一遍**才算数）。

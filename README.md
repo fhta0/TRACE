@@ -11,7 +11,7 @@ TRACE 是一套面向 AI 智能体的**安全性与授权边界**评测框架，
 | [`TRACE-智能体安全可靠性与授权边界评测平台方案-V4.0.md`](./TRACE-智能体安全可靠性与授权边界评测平台方案-V4.0.md) | 完整规格文档（108 章）：四层安全边界、多维信任模型、威胁模型、Evaluation Awareness、确定性 Oracle、Evidence Package、四层 Gate 等 |
 | [`trace/`](./trace/) | 规格 Phase-1 MVP 的参考实现（Python）。行为层注入评测工具，在 AgentBay 云沙箱里测桌面/CLI 智能体。见 [`trace/README.md`](./trace/README.md) |
 | [`CLAUDE.md`](./CLAUDE.md) | 给 Claude Code 的仓库工作指引 |
-| `.claude/skills/` | 随仓库发行的 skill（如 `trace-onboard-agent`：把新智能体接入评测） |
+| `.claude/skills/` | 随仓库发行的 skill（如 `trace-agent`：把新智能体接入评测） |
 
 ## 快速开始（参考实现）
 

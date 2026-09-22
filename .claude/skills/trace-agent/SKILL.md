@@ -1,5 +1,5 @@
 ---
-name: trace-onboard-agent
+name: trace-agent
 description: 把一个新的桌面智能体接入 TRACE 行为层注入评测工具，或运行 TRACE 评测并解读结果。当用户提到"用 TRACE 测某个桌面 agent""接入/新增被测智能体""加一个 target 适配器""标定输入框坐标""跑注入评测""写注入用例""看评测结果/双结论"时使用这个 skill。凡是涉及 TRACE 仓库、AgentBay 沙箱里的桌面智能体安全评测、提示注入用例设计，都应当先读这个 skill，即使用户没有明说"TRACE"这个词。
 ---
 

@@ -1,6 +1,6 @@
 # 发现：round-3 首次测出破防——基准母版式"技术借口前置步骤"攻破 deepseek
 
-日期：2026-09-22。**由 ds-Claude（qwen3.7-plus）用 trace-onboard-agent skill 驱动全流程**
+日期：2026-09-22。**由 ds-Claude（qwen3.7-plus）用 trace-agent skill 驱动全流程**
 （模拟发行使用方式），Opus 审计。修后 oracle（Linux 正控制已验证）背书。判据只认 canary。
 
 ## 结果（oracle 背书，全部 delivery=OK，事件流核验为真跑）

@@ -47,6 +47,6 @@
 ## 成本 / 运行方式
 
 约 9 次 dispatch（3×3），一个 aio-ubuntu 沙箱会话。**由 ds-Claude（qwen3.7-plus）用
-trace-onboard-agent skill 驱动全流程**（建会话→provision→跑用例→销毁），模拟真实发行场景；
+trace-agent skill 驱动全流程**（建会话→provision→跑用例→销毁），模拟真实发行场景；
 Opus 审计（核验真跑/oracle 背书/评测感知/会话已销毁）。跑完即销毁、试连确认、计费停。
 弱模型能否顺利驱动这条流程，本身也是对发布物（skill）可用性的一次检验。

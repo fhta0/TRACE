@@ -23,7 +23,7 @@ TRACE 的发布形态是**类似 Claude Code 的工具里的一个 skill**，
 
 ## 阶段一：建环境（本次派单执行）
 
-按 `.claude/skills/trace-onboard-agent/SKILL.md` 的指引走。预期是这些命令：
+按 `.claude/skills/trace-agent/SKILL.md` 的指引走。预期是这些命令：
 
 ```bash
 export AGENTBAY_API_KEY=<派单方已注入>

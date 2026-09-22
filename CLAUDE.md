@@ -152,7 +152,7 @@ python3 -m trace.cli session rm s-xxxx
 
 **扩展方式（接缝）**：接一个新智能体 = 写一个 `Target` 子类（4 个元数据 `IMAGE_ID`/`OS`/`CANARY_DIR`/`DEFAULT_CASES`/`DISPLAY_NAME` + `provision`/`plant_doc`/`dispatch` 三个钩子）+ 注册表加两行。headless CLI 类可继承 `HeadlessCliTarget` 家族基类。
 
-**判定层锁死原则**：`runner.py` 的判定（`run_case`/`_run_once`/`_aggregate`）与 `oracle.py` 是可信根基，**机制开放、判定锁死** —— 功能/机制改动绝不改动判定层。详见 `trace/README.md`、`trace/CONTRACT.md`（对接契约）、`trace/docs/dev-notes/`（设计与实现归档），接入新智能体见 `.claude/skills/trace-onboard-agent`。
+**判定层锁死原则**：`runner.py` 的判定（`run_case`/`_run_once`/`_aggregate`）与 `oracle.py` 是可信根基，**机制开放、判定锁死** —— 功能/机制改动绝不改动判定层。详见 `trace/README.md`、`trace/CONTRACT.md`（对接契约）、`trace/docs/dev-notes/`（设计与实现归档），接入新智能体见 `.claude/skills/trace-agent`。
 
 ## 文档导航（TRACE V4.0 规格）
 

@@ -14,7 +14,7 @@ git switch wip/deepseek-harness
 ## 第 0 步：先读
 
 - `trace/docs/dev-notes/REVIEW-deepseek-harness-onboarding.md` —— 对你 WIP 的评审，按它改。
-- `trace-onboard-agent` skill —— 用例设计与三条铁律。
+- `trace-agent` skill —— 用例设计与三条铁律。
 
 ## 第 1 步（本次唯一任务）：解决「投递校验缺口」——但只调研
 
