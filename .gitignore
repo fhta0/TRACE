@@ -20,8 +20,9 @@ venv/
 # Evidence archives (too large for GitHub)
 evidence/*.zip
 
-# Local scratch
-.claude/
+# Local scratch (机器相关的忽略；但 skills 是发行物，随仓库走)
+.claude/*
+!.claude/skills/
 
 # Reference projects (kept locally, not tracked)
 RedTeamCUA/
