@@ -56,10 +56,15 @@ def _validate_case(case: dict) -> None:
         raise ValueError("CASE_SCHEMA_INVALID: canary 必须是对象")
     if "type" not in canary:
         raise ValueError("CASE_SCHEMA_INVALID: canary 缺少必填字段：type")
-    if "path" not in canary:
-        raise ValueError("CASE_SCHEMA_INVALID: canary 缺少必填字段：path")
-    if canary.get("type") != "file_exists":
-        raise ValueError(f"UNSUPPORTED_CANARY_TYPE: v1 仅支持 canary.type=file_exists，收到 {canary.get('type')!r}")
+    # 两种 type：file_exists（旧，带绝对 path）/ marker_file（可移植，带 name，由 target 按 OS 解析）
+    if canary.get("type") not in ("file_exists", "marker_file"):
+        raise ValueError(
+            f"UNSUPPORTED_CANARY_TYPE: v1 支持 canary.type ∈ {{file_exists, marker_file}}，"
+            f"收到 {canary.get('type')!r}"
+        )
+    # path 或 name 至少给一个（path 优先，兼容旧用例；只给 name 由 target.resolve_canary 解析）
+    if "path" not in canary and "name" not in canary:
+        raise ValueError("CASE_SCHEMA_INVALID: canary 需要 'path' 或 'name' 之一")
 
 
 def _resolve_session_id(args: argparse.Namespace, case: dict) -> str:
@@ -192,7 +197,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
             sys.stderr.write(f"[TRACE] 沙箱桌面（可实时观看）：{desktop_url}\n")
 
         # 6. 跑用例
-        result = runner.run_case(case, session, evidence_dir, auto_calibrate=args.auto_calibrate)
+        # --target 覆盖：给了就用它选适配器（case/target 解耦），否则 run_case 内部用 case 的 target
+        run_target = None
+        if getattr(args, "target", None):
+            from .target import get_target
+            run_target = get_target(args.target, session)
+        result = runner.run_case(case, session, evidence_dir,
+                                 auto_calibrate=args.auto_calibrate, target=run_target)
 
         _write_result(out_path, result)
 
@@ -1374,7 +1385,8 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
         f"[TRACE] 批次开始：{total_cases} 个用例，session={session_id}\n"
     )
 
-    first_target_name = cases[0][1]["target"]
+    # case/target 解耦：--target 给了就用它驱动适配器（覆盖 case 的 target 字段），否则用首个 case 的 target
+    first_target_name = getattr(args, "target", None) or cases[0][1]["target"]
     from .target import get_target
     shared_target = get_target(first_target_name, session)
 
@@ -1692,6 +1704,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--case", required=True, help="case.json 路径")
     pr.add_argument("--out", required=True, help="result.json 输出路径")
     pr.add_argument("--session", default=None, help="会话 ID（优先级最高）")
+    pr.add_argument("--target", default=None,
+                    help="用此 target 驱动适配器，覆盖 case 里的 target 字段（case/target 解耦，可选）")
     pr.add_argument(
         "--evidence-dir", default=None,
         help="截图存放目录（默认：out 同级 evidence/）",
