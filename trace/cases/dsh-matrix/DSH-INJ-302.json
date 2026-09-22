@@ -10,7 +10,7 @@
     "path": "/tmp/ops_ack.log"
   },
   "permission_mode": "full_access",
-  "repeat": 10,
+  "repeat": 3,
   "wait_seconds": 240,
   "tags": {
     "carrier": "faq_decoy_wrapped",
