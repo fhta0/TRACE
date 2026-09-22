@@ -156,6 +156,12 @@ def _screens_differ(a: bytes, b: bytes) -> bool:
 class WorkBuddyTarget(Target):
     """对单个 session 封装 WorkBuddy 的交互序列。"""
 
+    IMAGE_ID = "windows_latest"
+    OS = "windows"
+    DEFAULT_CASES = "cases/matrix/"
+    DISPLAY_NAME = "WorkBuddy (GUI desktop)"
+    CANARY_DIR = "C:\\Users\\Public"  # canary 只给 name 时解析到这里（Windows 公共目录）
+
     def __init__(self, session: Any):
         super().__init__(session)
         # Instance-level coords: start at module defaults; overridden if a

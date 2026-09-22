@@ -6,7 +6,58 @@ from typing import Any
 
 
 class Target(ABC):
-    """一个被测桌面智能体的驱动适配器。子类实现如何投放注入、如何下发任务。"""
+    """一个被测桌面智能体的驱动适配器。子类实现如何投放注入、如何下发任务。
+
+    ★ 子类必须声明四个类属性（Target 元数据契约，§1）：
+        IMAGE_ID        AgentBay 镜像名（如 "aio-ubuntu-2404"）
+        OS              "linux" | "windows"
+        DEFAULT_CASES   默认用例目录（相对仓库，如 "cases/dsh-matrix/"）
+        DISPLAY_NAME    人读名（如 "DeepSeek Harness (headless CLI)"）
+    基类给默认 None；validate_meta() 校验四项都已声明。
+    """
+
+    IMAGE_ID: str | None = None
+    OS: str | None = None
+    DEFAULT_CASES: str | None = None
+    DISPLAY_NAME: str | None = None
+
+    # canary 抽象化（Phase 2 · Step 1）：case 的 canary 若只给 name（不给绝对 path），
+    # 由 target 按自己的 OS 用 CANARY_DIR 拼出具体路径。子类按 OS 覆盖（Linux→/tmp、Windows→公共目录）。
+    CANARY_DIR: str | None = None
+
+    @classmethod
+    def validate_meta(cls) -> None:
+        """校验四项元数据都已由子类声明，任一为 None 即抛 NotImplementedError。"""
+        missing = [
+            a for a in ("IMAGE_ID", "OS", "DEFAULT_CASES", "DISPLAY_NAME")
+            if getattr(cls, a) is None
+        ]
+        if missing:
+            raise NotImplementedError(
+                f"{cls.__name__} 未声明必填元数据：{missing}"
+            )
+
+    def resolve_canary(self, canary: dict) -> str:
+        """把 case 的 canary 声明解析成一个具体路径（供 oracle 判定 + 文档占位符替换用）。
+
+        - 有显式 `path` → 直接用它（**旧用例兼容**，不改行为）。
+        - 否则用 `name` + 本 target 的 `CANARY_DIR` 按 OS 拼接（可移植用例）。
+        解析只决定"查哪个文件"，不参与判定；判定仍由 oracle 存在性检查 + runner 聚合负责。
+        """
+        path = canary.get("path")
+        if path:
+            return path
+        name = canary.get("name")
+        if not name:
+            raise ValueError(f"canary 需要 'path' 或 'name' 之一：{canary!r}")
+        if self.CANARY_DIR is None:
+            raise ValueError(
+                f"{type(self).__name__} 未声明 CANARY_DIR，无法用 name 解析 canary：{canary!r}"
+            )
+        d = self.CANARY_DIR.rstrip("/\\")
+        # Windows 路径（带盘符或反斜杠）用 \\ 拼，POSIX 用 /
+        sep = "\\" if (("\\" in self.CANARY_DIR) or (len(d) >= 2 and d[1] == ":")) else "/"
+        return f"{d}{sep}{name}"
 
     def __init__(self, session: Any):
         self.session = session
@@ -27,10 +78,72 @@ class Target(ABC):
         """向智能体下发一个正常任务，等待其执行，返回一张截图的 PNG bytes。"""
         raise NotImplementedError
 
+    def cleanup_doc(self, path: str) -> None:
+        """删除本次投放的注入文档（每次 run 结束后调用）。
+
+        为什么需要（§测量卫生）：plant_doc 把注入文档写进 agent 工作区，
+        若不清理，**上一个用例/上一次 repeat 的注入文档会残留**，多用例同会话时
+        agent 可能对前一个用例的注入动作，污染测量。这里在每次 run 收尾时删掉自己
+        投放的文档，保证下一次投放前工作区是干净的。
+
+        清理失败不应让整个 run 失败（证据已采、canary 已判），仅告警。
+        默认实现走 filesystem MCP 的 delete_file；子类如落盘方式不同可覆盖。
+        """
+        import sys
+        try:
+            self.session.filesystem.delete_file(path)
+        except Exception as e:  # noqa: BLE001 — 清理尽力而为，不阻断
+            sys.stderr.write(f"[TRACE] ⚠ cleanup_doc 未能删除 {path}：{e}\n")
+
+
+# ---------------------------------------------------------------------------
+# 注册表（懒构造，避免与 target_workbuddy / target_deepseek_harness 循环导入）
+# ---------------------------------------------------------------------------
+_REGISTRY: dict[str, type["Target"]] | None = None
+
+
+def _build_registry() -> dict[str, type["Target"]]:
+    """延迟构造注册表。子类在函数内 import，避免循环导入。"""
+    from .target_workbuddy import WorkBuddyTarget
+    from .target_deepseek_harness import DeepseekHarnessTarget
+
+    return {
+        "workbuddy": WorkBuddyTarget,
+        "deepseek-harness": DeepseekHarnessTarget,
+    }
+
+
+def _registry() -> dict[str, type["Target"]]:
+    global _REGISTRY
+    if _REGISTRY is None:
+        _REGISTRY = _build_registry()
+    return _REGISTRY
+
+
+def known_targets() -> list[str]:
+    """返回已注册 target 名（按字母排序）。"""
+    return sorted(_registry())
+
+
+def _lookup(name: str) -> type["Target"]:
+    """按 name 查注册表；未知 name 抛 NotImplementedError，错误信息列出已知 target。"""
+    cls = _registry().get(name)
+    if cls is None:
+        raise NotImplementedError(
+            f"未知 target: {name!r}，已知: {known_targets()}"
+        )
+    return cls
+
 
 def get_target(name: str, session: Any) -> Target:
-    """按 case['target'] 选择适配器。懒加载具体实现，避免循环导入。"""
-    if name == "workbuddy":
-        from .target_workbuddy import WorkBuddyTarget
-        return WorkBuddyTarget(session)
-    raise NotImplementedError(f"未知的 target: {name!r}（当前仅支持 'workbuddy'）")
+    """按 case['target'] 选择适配器。实例化后校验元数据。"""
+    cls = _lookup(name)
+    cls.validate_meta()
+    return cls(session)
+
+
+def target_meta(name: str) -> type["Target"]:
+    """只取类（读元数据用，无需 session）。未知 name 报错，错误信息列出已知 target。"""
+    cls = _lookup(name)
+    cls.validate_meta()
+    return cls

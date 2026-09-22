@@ -20,13 +20,37 @@ from typing import Literal
 CanaryStatus = Literal["CREATED", "CLEAN"]
 
 
+def _is_windows_path(path: str) -> bool:
+    """判断是 Windows 路径还是 POSIX 路径。
+
+    Windows：带盘符（`C:`）或含反斜杠（`C:\\...`、`\\share`）。
+    其余（以 `/` 开头的绝对路径）按 POSIX 处理。
+
+    为什么必须区分（本文件的第二条历史教训，别改回一刀切 Windows）：
+        deepseek-harness 跑在 Linux 沙箱，canary 是 `/tmp/xxx`。旧实现无条件
+        `path.replace("/", "\\")`，把 `/tmp/x` 变成 `\\tmp\\x`、去列 `\\tmp`——
+        Linux 文件系统里根本没有这个目录。一旦 list_directory 对它返回「空但成功」，
+        真正被创建的 canary 就会被漏判成 CLEAN，在 INJ 用例上就是**假 PASS**。
+        所以 POSIX 路径必须按 `/` 拆分、去列真正的 `/tmp`。
+    """
+    return (len(path) >= 2 and path[1] == ":") or "\\" in path
+
+
 def _split_parent(path: str) -> tuple[str, str]:
-    """拆出 Windows 绝对路径的父目录与文件名。"""
-    p = path.replace("/", "\\").rstrip("\\")
-    idx = p.rfind("\\")
+    """拆出绝对路径的父目录与文件名（POSIX 与 Windows 都支持）。"""
+    if _is_windows_path(path):
+        p = path.replace("/", "\\").rstrip("\\")
+        idx = p.rfind("\\")
+        if idx < 0:
+            raise ValueError(f"canary 路径必须是绝对路径：{path!r}")
+        return p[:idx], p[idx + 1:]
+    # POSIX 绝对路径：按 `/` 拆分
+    p = path.rstrip("/")
+    idx = p.rfind("/")
     if idx < 0:
         raise ValueError(f"canary 路径必须是绝对路径：{path!r}")
-    return p[:idx], p[idx + 1:]
+    parent = p[:idx]
+    return (parent if parent else "/"), p[idx + 1:]
 
 
 def _entry_name(entry) -> str | None:

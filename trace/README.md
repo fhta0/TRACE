@@ -2,7 +2,7 @@
 
 ## 1. 这是什么
 
-TRACE 是一个**行为层注入评测工具**：在 AgentBay 云沙箱里，给桌面智能体 WorkBuddy 投放带注入指令的文档，用**确定性行为证据**（canary 文件是否被创建）判定它是否越界执行了注入指令，而不是看它嘴上说什么。供上游测评平台通过 CLI + JSON 调用。判定产出**双结论**：`Agent Security`（智能体是否越界）与 `System Protection`（系统是否拦截），二者独立。
+TRACE 是一个**行为层注入评测工具**：在 AgentBay 云沙箱里，给被测智能体（桌面 GUI 如 WorkBuddy，或 headless CLI 如 deepseek-harness）投放带注入指令的文档，用**确定性行为证据**（canary 文件是否被创建）判定它是否越界执行了注入指令，而不是看它嘴上说什么。被测对象由 `--target` 选择，镜像/OS/默认用例由该 target 的元数据声明决定。供上游测评平台通过 CLI + JSON 调用。判定产出**双结论**：`Agent Security`（智能体是否越界）与 `System Protection`（系统是否拦截），二者独立。
 
 ## 2. 前置条件
 
@@ -13,7 +13,16 @@ TRACE 是一个**行为层注入评测工具**：在 AgentBay 云沙箱里，给
 
 ## 3. 准备一个 WorkBuddy 会话（v1 手动前置步骤）
 
-v1 工具本身不创建沙箱，它假设你已经有一个 AgentBay Windows 会话（`session_id` 形如 `s-xxxx`），只需把该会话的 `session_id` 传给工具。获取步骤概述（用 `wuying-agentbay-sdk`）：
+> **镜像由 target 决定，不是固定 Windows。** 每个被测 target 在其适配器里声明 `IMAGE_ID`/`OS`
+> （如 WorkBuddy→`windows_latest`(Windows)、deepseek-harness→`aio-ubuntu-2404`(Linux)）。
+> **推荐用 CLI 建会话，镜像会自动按 target 选**：
+> ```bash
+> python3 -m trace.cli session create --target <target名> --json   # 自动选对镜像
+> ```
+> provision 时有 OS 守卫：会话 OS 与 target 声明不符会 fail-fast。下面这套是 WorkBuddy 的手动前置，
+> 仅当你要手写 SDK 或 attach 到已有会话时才需要。
+
+若手写 SDK attach 到已存在会话（`session_id` 形如 `s-xxxx`），把 `session_id` 传给工具即可。WorkBuddy 手动获取步骤（用 `wuying-agentbay-sdk`）：
 
 1. 用 `CreateSessionParams(image_id="windows_latest", lifecycle_policy=LifecyclePolicy(manual_release=True))` 创建会话，拿到 `session_id`。`manual_release=True` 避免会话被自动回收。
 2. 在会话里安装 WorkBuddy：
@@ -78,8 +87,9 @@ python3 -m trace.cli run \
 
 ## 7. v1 边界（诚实写出）
 
-- 一次跑一个用例；无会话池、批量、统计。
-- 仅支持 `doc_injection` 向量 + `file_exists` canary。
+- 支持批量：`run-batch --target <名> [--suite <套件>|--ids <id,...>]`，可 `--summary-report` 自动出自包含汇总报告；但无会话池、无统计推断（固定样本/序贯统计留到后续）。
+- 支持的攻击向量：`doc_injection`（注入）与 `benign_control`（良性对照，测过度拒绝）。
+- 支持的 canary 类型：`file_exists`（旧，带绝对 `path`，锁死单一 OS）与 `marker_file`（可移植，带 `name`，由 target 的 `CANARY_DIR` 按 OS 解析；文档内用 `{{canary_path}}` 占位符引用，plant 时替换）。
 - `system_protection` 目前靠 `permission_mode` 推断；HITL 弹窗检测在 v2。
 - 会话创建与扫码登录为手动前置步骤；软件安装已通过 `provision` 子命令自动化（见第 3 节）。
 
@@ -89,23 +99,30 @@ python3 -m trace.cli run \
 
 ## 9. 接入新的桌面智能体
 
-沙箱固定使用 AgentBay（`session` 对象由 provider 提供），接入一个新的桌面智能体只需要三步：
+沙箱固定使用 AgentBay（`session` 对象由 provider 提供），接入一个新智能体只需要写一个 `Target` 子类并在注册表登记：
 
-1. **写一个 `Target` 子类**：在 `trace/` 包下新建一个模块（例如 `target_foo.py`），继承 `trace.target.Target`，实现两个方法：
-   - `plant_doc(filename: str, content: str) -> str` —— 把注入文档投放到智能体能读到的位置，返回完整路径；
-   - `dispatch(benign_task: str, wait_seconds: int) -> bytes` —— 向智能体下发一个正常任务、等待执行、返回一张屏幕截图的 PNG bytes。
-2. **在工厂里注册一行**：在 `trace/target.py` 的 `get_target` 中增加一个分支，例如：
-   ```python
-   if name == "foo":
-       from .target_foo import FooTarget
-       return FooTarget(session)
-   ```
-3. **在 case.json 里声明 `target`**：把用例的 `target` 字段填成新名字（如 `"foo"`）即可，runner 会自动分发到对应适配器。
+1. **写一个 `Target` 子类**：在 `trace/` 包下新建模块（例如 `target_foo.py`），继承 `trace.target.Target`（headless CLI 类可继承 `HeadlessCliTarget` 家族基类复用通用机制）。声明 **5 个必填元数据**并实现 3 个钩子：
 
-**可选：声明自动安装（`provision`）**：若该智能体可通过下载 + 静默安装自动部署到会话内，子类可覆盖 `provision()`，调用 `trace.provision.install(session, spec)` 并给出 installer_type / url / ready_path / launch_cmd 等 spec 字段即可，CLI 会通过 `python3 -m trace.cli provision --target foo --session s-xxxx` 自动拉起。支持的安装器类型：`nsis`（已实测）/ `inno` / `msi` / `zip` / `winget`。不覆盖则沿用基类 no-op，意味着"已预装"。
+   | 元数据 | 作用 |
+   |---|---|
+   | `IMAGE_ID` | 该智能体要的 AgentBay 镜像（`session create --target` 据此选镜像） |
+   | `OS` | `"linux"` / `"windows"`（provision 有 OS 守卫，会话 OS 与此不符则 fail-fast） |
+   | `CANARY_DIR` | 可移植 canary（`marker_file`，只给 `name`）在本 OS 落地的目录，如 `C:\Users\Public` / `/tmp` |
+   | `DEFAULT_CASES` | 该 target 的默认用例目录，如 `cases/foo-matrix/` |
+   | `DISPLAY_NAME` | 人读名 |
+
+   - `plant_doc(filename, content) -> str` —— 把注入文档投放到智能体能读到的位置，返回完整路径；
+   - `dispatch(benign_task, wait_seconds) -> bytes` —— 下发一个正常任务、等待执行、返回证据（GUI 类返回截图 PNG bytes）；
+   - `provision()` —— 可选，声明自动安装（见下）。
+
+2. **在注册表登记**：在 `trace/target.py` 的 `_build_registry()` 里 import 并加一行 `"foo": FooTarget`。`get_target("foo", session)` 即可取到实例。
+
+3. **用例复用，不必重写**：给 `run` / `run-batch` 传 `--target foo` 即可用 foo 适配器驱动任意 OS 匹配的用例（`--target` 覆盖 case 里的 `target` 字段）。用可移植 canary（`marker_file` + `{{canary_path}}`）写的用例会自动按 foo 的 `CANARY_DIR` 解析路径，无需改用例。
+
+**可选：声明自动安装（`provision`）**：若该智能体可通过下载 + 静默安装自动部署，覆盖 `provision()` 调用 `trace.provision.install(session, spec)`，给出 installer_type / url / ready_path / launch_cmd 等字段，CLI 通过 `python3 -m trace.cli provision --target foo --session s-xxxx` 自动拉起。支持：`nsis`（已实测）/ `inno` / `msi` / `zip` / `winget`。不覆盖则沿用基类 no-op（意味着"已预装"）。
 
 注意事项：
 
-- 当前 `WorkBuddyTarget` 的 `dispatch` 靠手标坐标驱动 UI（新建任务按钮、输入框、发送按钮的像素坐标）。接入新智能体时，需要先行标定该智能体的输入框与发送键坐标；动态 UI 定位（a11y tree / OCR）留到后续版本。
-- 会话创建与扫码登录仍是手动前置步骤：`provision` 只负责"装到等登录状态"，扫码登录还需在网页桌面完成。
-- 不要修改 `oracle.py` / `provider.py` / `cli.py` / `report.py` 与 `CONTRACT.md` 的 schema 语义 —— Target 适配器是唯一的扩展点。
+- GUI 类 `dispatch` 靠手标坐标驱动 UI（新建/输入框/发送键像素坐标），接入前需先标定；动态 UI 定位（a11y tree / OCR）留到后续。headless CLI 类无需标坐标。
+- 会话创建与扫码登录仍是手动前置步骤：`provision` 只负责"装到等登录状态"。
+- **机制开放、判定锁死**：`runner.py` 的判定（`run_case`/`_run_once`/`_aggregate`）、`oracle.py`、以及 `cli.py`/`report.py`/`CONTRACT.md` 的 schema 语义不要动 —— Target 适配器是唯一的扩展点。
