@@ -287,6 +287,24 @@ def _cmd_provision(args: argparse.Namespace) -> int:
     session = provider.get_session(session_id)
     target = get_target(target_name, session)
 
+    # 通用 OS 守卫：会话真实 OS 必须与 target 声明的 OS 一致，否则 fail-fast。
+    # 不针对任何具体 target——从 target.OS 读期望，探针查实际。
+    expected_os = target.OS  # "linux" | "windows"
+    detected_os = "windows"
+    try:
+        r = session.command.execute_command("uname -s")
+        out = str(getattr(r, "output", None) or getattr(r, "data", None) or r)
+        if "Linux" in out:
+            detected_os = "linux"
+    except Exception:
+        detected_os = "windows"   # uname 失败通常意味着非 Linux（如 Windows）
+    if expected_os and detected_os != expected_os:
+        raise SystemExit(
+            f"环境不匹配：目标 {target_name} 需要 {expected_os} 镜像"
+            f"（{target.IMAGE_ID}），当前会话探测为 {detected_os}。"
+            f"请用 `session create --target {target_name}` 重建会话。"
+        )
+
     sys.stderr.write("[TRACE] 开始自动安装（后台 bat + flag 轮询）...\n")
     sys.stderr.write(
         "[TRACE] 提示：下载 507MB 需要数分钟；期间会持续打印进度。\n"
@@ -734,14 +752,45 @@ def _cmd_session_create(args: argparse.Namespace) -> int:
     if getattr(args, "label", None):
         labels = {"name": args.label}
 
+    # 镜像优先级：显式 --image > --target 的 IMAGE_ID > 旧默认 windows_latest
+    image = args.image
+    if not image and getattr(args, "target", None):
+        from .target import target_meta, known_targets
+        try:
+            image = target_meta(args.target).IMAGE_ID
+        except Exception:
+            msg = f"UNKNOWN_TARGET: 未知 target {args.target!r}，已知: {known_targets()}"
+            if use_json:
+                json.dump({"error": {"code": "UNKNOWN_TARGET", "message": msg}},
+                          sys.stdout, ensure_ascii=False, indent=2)
+                sys.stdout.write("\n")
+            else:
+                sys.stderr.write(f"[TRACE] ✗ {msg}\n")
+            return EXIT_INPUT_INVALID
+    if args.image and getattr(args, "target", None):
+        # 两个都给且不一致 → 只警告不阻断（用户可能有意覆盖）
+        tgt_img = None
+        try:
+            from .target import target_meta as _tm
+            tgt_img = _tm(args.target).IMAGE_ID
+        except Exception:
+            tgt_img = None
+        if tgt_img and tgt_img != args.image:
+            sys.stderr.write(
+                f"[TRACE] ⚠ --image={args.image} 与 target {args.target} 的默认镜像 "
+                f"{tgt_img} 不一致，按 --image 覆盖。\n"
+            )
+    if not image:
+        image = "windows_latest"   # 两者都没给时的兜底默认（保持旧行为）
+
     if not use_json:
         sys.stderr.write(
-            f"[TRACE] 正在创建会话（image={args.image}, manual_release=True）...\n"
+            f"[TRACE] 正在创建会话（image={image}, manual_release=True）...\n"
         )
 
     try:
         session = provider.create_session(
-            image_id=args.image or None,
+            image_id=image,
             labels=labels,
             manual_release=True,
         )
@@ -1649,8 +1698,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="创建新会话（默认 manual_release=True，避免长流程被自动回收）。创建后轮询等屏幕参数稳定再返回。",
     )
     psc.add_argument(
-        "--image", default="windows_latest",
-        help="镜像 ID（默认 windows_latest）。",
+        "--image", default=None,
+        help="镜像 ID（可选；优先级：显式 --image > --target 的默认镜像 > windows_latest 兜底）。",
+    )
+    psc.add_argument(
+        "--target", default=None,
+        help="被测目标名，据此选默认镜像（可选）。",
     )
     psc.add_argument(
         "--label", default=None,
