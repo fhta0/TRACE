@@ -33,3 +33,5 @@ deepseek-harness/
 # Local test/debug files
 workbuddy_injection_report.html
 verify_login_persist.py
+issue_provision_failed.md
+test_workbuddy.sh
