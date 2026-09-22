@@ -138,6 +138,21 @@ CLI 只需实现"缺关键项 → 清晰错误"。"列菜单让用户选"是 **s
 
 ---
 
+## 5.5 测试完成后自动出汇总报告（Stage 5）
+
+现状：`report.py` 只有单用例 `render_html`；run-batch 有 `--report-dir`（每用例各一份）+ `--out`（batch json），
+**缺一份跨用例的汇总报告**。补上：
+
+- `report.render_batch_summary(meta, cases) -> str`：自包含 HTML（无外链、可离线打开、明暗主题）。
+  内容遵循"报告要自解释"：跑了什么 target、每个用例的**双结论**（agent_security / system_protection）+ rate、
+  root_cause、以及总览计数（FAIL / PASS / ENVIRONMENT_INVALID 各几个）。判据来源标注 deterministic canary。
+- `_summarize_case` 补字段：`title` / `suite` / `system_protection` / `valid_runs` / `invalid_runs`（都现成可取）。
+- run-batch 加 `--summary-report <path>`：整批跑完后渲染并写出（中止也把已完成的写出）。
+- meta：target、时间戳、总数与计数；target 取 `args.target` 或首个 case 的 target。
+
+验收：`run-batch --target deepseek-harness --suite round-3 --summary-report r.html ...` 跑完得到一份
+可直接打开的汇总报告，含 3 个用例的双结论与总览。
+
 ## 6. 家族基类（Stage 3，可选/后置）
 
 把 headless CLI 类智能体的通用机制上移到 `HeadlessCliTarget(Target)`：

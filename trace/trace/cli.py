@@ -1265,12 +1265,20 @@ def _do_health_check(target: Any, target_name: str) -> tuple[bool, str]:
 
 
 def _summarize_case(case: dict, result: dict, result_path: str) -> dict:
-    """构造单条 case 的批次汇总条目（字段名对齐 §FEAT-run-batch 示例）。"""
+    """构造单条 case 的批次汇总条目（字段名对齐 §FEAT-run-batch 示例）。
+
+    Stage 5：补 title/suite/system_protection/valid_runs/invalid_runs，供汇总报告使用。
+    """
     return {
         "id": case["id"],
+        "title": case.get("title"),
+        "suite": case.get("suite"),
         "agent_security": result.get("agent_security"),
+        "system_protection": result.get("system_protection"),
         "root_cause": result.get("root_cause"),
         "failure_rate": result.get("failure_rate"),
+        "valid_runs": result.get("valid_runs"),
+        "invalid_runs": result.get("invalid_runs"),
         "result_path": result_path,
     }
 
@@ -1628,6 +1636,35 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
         json.dump(summary, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
 
+    # Stage 5：整批跑完后生成一份自包含的 HTML 汇总报告（可选）。
+    # 即使中途被中止，也把已完成的用例汇总出来。
+    if getattr(args, "summary_report", None):
+        try:
+            from . import report as _report
+            rep_counts: dict[str, int] = {}
+            for c in summary_cases:
+                v = c.get("agent_security") or "UNKNOWN"
+                rep_counts[v] = rep_counts.get(v, 0) + 1
+            tgt = getattr(args, "target", None) or (cases[0][1].get("target") if cases else None)
+            report_meta = {
+                "target": tgt,
+                "timestamp": batch_id,
+                "total": len(summary_cases),
+                "counts": rep_counts,
+                "session_id": session_id,
+                "suite": getattr(args, "suite", None),
+            }
+            html_text = _report.render_batch_summary(report_meta, summary_cases)
+            rp = os.path.abspath(args.summary_report)
+            rp_dir = os.path.dirname(rp)
+            if rp_dir:
+                os.makedirs(rp_dir, exist_ok=True)
+            with open(rp, "w", encoding="utf-8") as f:
+                f.write(html_text)
+            sys.stderr.write(f"[TRACE] 批次汇总报告 -> {rp}\n")
+        except Exception as e:  # noqa: BLE001 — 报告失败不该让整批失败
+            sys.stderr.write(f"[TRACE] ⚠ 汇总报告生成失败：{e}\n")
+
     total_elapsed = time.monotonic() - batch_start
     sys.stderr.write(
         f"[TRACE] 批次结束：measured={measured_count} "
@@ -1720,6 +1757,10 @@ def build_parser() -> argparse.ArgumentParser:
     prb.add_argument(
         "--report-dir", default=None,
         help="可选，每个用例一份 HTML 报告，输出到该目录。",
+    )
+    prb.add_argument(
+        "--summary-report", default=None,
+        help="可选，整批跑完生成一份自包含的 HTML 汇总报告到该路径。",
     )
     prb.add_argument(
         "--json", action="store_true",
