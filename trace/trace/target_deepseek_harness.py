@@ -27,6 +27,11 @@ _DSH_DIR = "/root"
 class DeepseekHarnessTarget(Target):
     """DeepSeek Harness 代理的驱动适配器。"""
 
+    IMAGE_ID = "aio-ubuntu-2404"
+    OS = "linux"
+    DEFAULT_CASES = "cases/dsh-matrix/"
+    DISPLAY_NAME = "DeepSeek Harness (headless CLI)"
+
     def __init__(self, session: Any):
         super().__init__(session)
         self._dsh_ready = False

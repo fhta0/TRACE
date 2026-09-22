@@ -6,7 +6,32 @@ from typing import Any
 
 
 class Target(ABC):
-    """一个被测桌面智能体的驱动适配器。子类实现如何投放注入、如何下发任务。"""
+    """一个被测桌面智能体的驱动适配器。子类实现如何投放注入、如何下发任务。
+
+    ★ 子类必须声明四个类属性（Target 元数据契约，§1）：
+        IMAGE_ID        AgentBay 镜像名（如 "aio-ubuntu-2404"）
+        OS              "linux" | "windows"
+        DEFAULT_CASES   默认用例目录（相对仓库，如 "cases/dsh-matrix/"）
+        DISPLAY_NAME    人读名（如 "DeepSeek Harness (headless CLI)"）
+    基类给默认 None；validate_meta() 校验四项都已声明。
+    """
+
+    IMAGE_ID: str | None = None
+    OS: str | None = None
+    DEFAULT_CASES: str | None = None
+    DISPLAY_NAME: str | None = None
+
+    @classmethod
+    def validate_meta(cls) -> None:
+        """校验四项元数据都已由子类声明，任一为 None 即抛 NotImplementedError。"""
+        missing = [
+            a for a in ("IMAGE_ID", "OS", "DEFAULT_CASES", "DISPLAY_NAME")
+            if getattr(cls, a) is None
+        ]
+        if missing:
+            raise NotImplementedError(
+                f"{cls.__name__} 未声明必填元数据：{missing}"
+            )
 
     def __init__(self, session: Any):
         self.session = session
@@ -45,12 +70,54 @@ class Target(ABC):
             sys.stderr.write(f"[TRACE] ⚠ cleanup_doc 未能删除 {path}：{e}\n")
 
 
+# ---------------------------------------------------------------------------
+# 注册表（懒构造，避免与 target_workbuddy / target_deepseek_harness 循环导入）
+# ---------------------------------------------------------------------------
+_REGISTRY: dict[str, type["Target"]] | None = None
+
+
+def _build_registry() -> dict[str, type["Target"]]:
+    """延迟构造注册表。子类在函数内 import，避免循环导入。"""
+    from .target_workbuddy import WorkBuddyTarget
+    from .target_deepseek_harness import DeepseekHarnessTarget
+
+    return {
+        "workbuddy": WorkBuddyTarget,
+        "deepseek-harness": DeepseekHarnessTarget,
+    }
+
+
+def _registry() -> dict[str, type["Target"]]:
+    global _REGISTRY
+    if _REGISTRY is None:
+        _REGISTRY = _build_registry()
+    return _REGISTRY
+
+
+def known_targets() -> list[str]:
+    """返回已注册 target 名（按字母排序）。"""
+    return sorted(_registry())
+
+
+def _lookup(name: str) -> type["Target"]:
+    """按 name 查注册表；未知 name 抛 NotImplementedError，错误信息列出已知 target。"""
+    cls = _registry().get(name)
+    if cls is None:
+        raise NotImplementedError(
+            f"未知 target: {name!r}，已知: {known_targets()}"
+        )
+    return cls
+
+
 def get_target(name: str, session: Any) -> Target:
-    """按 case['target'] 选择适配器。懒加载具体实现，避免循环导入。"""
-    if name == "workbuddy":
-        from .target_workbuddy import WorkBuddyTarget
-        return WorkBuddyTarget(session)
-    if name == "deepseek-harness":
-        from .target_deepseek_harness import DeepseekHarnessTarget
-        return DeepseekHarnessTarget(session)
-    raise NotImplementedError(f"未知的 target: {name!r}（当前支持: 'workbuddy', 'deepseek-harness'）")
+    """按 case['target'] 选择适配器。实例化后校验元数据。"""
+    cls = _lookup(name)
+    cls.validate_meta()
+    return cls(session)
+
+
+def target_meta(name: str) -> type["Target"]:
+    """只取类（读元数据用，无需 session）。未知 name 报错，错误信息列出已知 target。"""
+    cls = _lookup(name)
+    cls.validate_meta()
+    return cls
