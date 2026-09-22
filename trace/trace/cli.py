@@ -1139,6 +1139,95 @@ def _resolve_cases(cases_arg: str) -> list[str]:
     return parts
 
 
+def _cmd_cases_list(args: argparse.Namespace) -> int:
+    """列出某 target（或某目录）的用例菜单。只读，不需要 session。"""
+    from .target import target_meta, known_targets
+    cases_dir = args.cases
+    if not cases_dir and getattr(args, "target", None):
+        try:
+            cases_dir = target_meta(args.target).DEFAULT_CASES
+        except Exception:
+            sys.stderr.write(f"[TRACE] ✗ UNKNOWN_TARGET: {args.target!r}，已知: {known_targets()}\n")
+            return EXIT_INPUT_INVALID
+    if not cases_dir:
+        sys.stderr.write("[TRACE] ✗ 需要 --target 或 --cases <目录> 之一\n")
+        return EXIT_INPUT_INVALID
+    if not os.path.isdir(cases_dir):
+        sys.stderr.write(f"[TRACE] ✗ 用例目录不存在：{cases_dir}\n")
+        return EXIT_INPUT_INVALID
+    rows = []
+    for fn in sorted(os.listdir(cases_dir)):
+        if not fn.endswith(".json") or fn.startswith(("_", ".")):
+            continue
+        try:
+            with open(os.path.join(cases_dir, fn), encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        rows.append({
+            "id": d.get("id", fn),
+            "title": d.get("title", "-"),
+            "suite": d.get("suite", "-"),
+            "vector": d.get("vector", "-"),
+        })
+    if getattr(args, "json", False):
+        json.dump({"cases_dir": cases_dir, "cases": rows}, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        sys.stderr.write(f"[TRACE] 用例目录：{cases_dir}（{len(rows)} 个）\n")
+        for r in rows:
+            sys.stdout.write(
+                f"  {r['id']:<14} {r['title']:<30} suite={r['suite']:<9} vector={r['vector']}\n"
+            )
+    return EXIT_SUCCESS
+
+
+def _resolve_batch_cases(args: argparse.Namespace) -> list[str]:
+    """按优先级把 run-batch 的选择解析成 case 文件路径列表。
+
+    优先级：--cases（旧行为：目录/路径列表）> --ids > --suite > --target 全部。
+    都没有 → 抛 ValueError（调用方负责 fail-fast）。
+    """
+    if getattr(args, "cases", None):
+        return _resolve_cases(args.cases)  # 旧行为，向后兼容
+    from .target import target_meta, known_targets
+    tgt = getattr(args, "target", None)
+    if not tgt:
+        raise ValueError("BATCH_SELECT_MISSING: 需要 --cases 或 --target 之一")
+    try:
+        cases_dir = target_meta(tgt).DEFAULT_CASES
+    except Exception:
+        raise ValueError(f"UNKNOWN_TARGET: {tgt!r}，已知: {known_targets()}")
+    if not cases_dir or not os.path.isdir(cases_dir):
+        raise ValueError(f"BATCH_CASES_DIR_MISSING: target {tgt!r} 的 DEFAULT_CASES 不存在：{cases_dir}")
+    allcases: list[tuple[str, str, str]] = []
+    for fn in sorted(os.listdir(cases_dir)):
+        if not fn.endswith(".json") or fn.startswith(("_", ".")):
+            continue
+        p = os.path.join(cases_dir, fn)
+        try:
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        allcases.append((d.get("id"), d.get("suite"), p))
+    ids_arg = getattr(args, "ids", None)
+    suite_arg = getattr(args, "suite", None)
+    if ids_arg:
+        want = [s.strip() for s in ids_arg.split(",") if s.strip()]
+        idmap = {cid: p for cid, _s, p in allcases if cid}
+        missing = [w for w in want if w not in idmap]
+        if missing:
+            raise ValueError(f"BATCH_IDS_NOT_FOUND: {cases_dir} 里找不到 id：{missing}")
+        return [idmap[w] for w in want]
+    if suite_arg:
+        sel = [p for _cid, s, p in allcases if s == suite_arg]
+        if not sel:
+            raise ValueError(f"BATCH_SUITE_EMPTY: {cases_dir} 里没有 suite={suite_arg!r} 的用例")
+        return sel
+    return [p for _cid, _s, p in allcases]
+
+
 def _format_duration(seconds: float) -> str:
     """格式化成 Xm Ys（便于进度输出，人读友好）。"""
     total = max(0, int(seconds))
@@ -1206,9 +1295,9 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
     batch_start = time.monotonic()
     batch_id = _dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
-    # 1. 解析 --cases（目录不存在 / 列表为空 → 退出 3）
+    # 1. 解析用例选择（--cases / --ids / --suite / --target；缺选择 → 退出 3）
     try:
-        case_paths = _resolve_cases(args.cases)
+        case_paths = _resolve_batch_cases(args)
     except ValueError as e:
         sys.stderr.write(f"[TRACE] ✗ {e}\n")
         return EXIT_INPUT_INVALID
@@ -1597,11 +1686,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     prb.add_argument(
-        "--cases", required=True,
+        "--cases", required=False, default=None,
         help=(
             "用例来源：目录（取其下所有 *.json），或逗号分隔的文件列表。"
             "schema 校验在批次开跑前一次性完成。"
+            "与 --target/--suite/--ids 互斥优先级：--cases 最高（向后兼容）。"
         ),
+    )
+    prb.add_argument(
+        "--target", default=None,
+        help="按 target 默认用例目录选用例（来自 target 元数据声明）。",
+    )
+    prb.add_argument(
+        "--suite", default=None,
+        help="按 suite 名过滤（在 target 默认目录里匹配 case['suite']）。",
+    )
+    prb.add_argument(
+        "--ids", default=None,
+        help="按 case id 选择（逗号分隔，在 target 默认目录里按 case['id'] 匹配）。",
     )
     prb.add_argument(
         "--out-dir", required=True,
@@ -1759,6 +1861,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="会话 ID。",
     )
     psu.set_defaults(func=_cmd_session_url)
+
+    # ---- cases 子命令组：用例菜单（只读，不进沙箱） ----
+    pcs = sub.add_parser(
+        "cases",
+        help="用例管理：list（只读，不进沙箱、无 session）。",
+    )
+    scs = pcs.add_subparsers(dest="cases_cmd", required=True)
+
+    # cases list
+    pscl = scs.add_parser(
+        "list",
+        help="列出某 target（或某目录）的用例菜单（id / title / suite / vector）。",
+    )
+    pscl.add_argument(
+        "--target", default=None,
+        help="target 名称，取其 DEFAULT_CASES 目录（与 --cases 二选一）。",
+    )
+    pscl.add_argument(
+        "--cases", default=None,
+        help="直接用例目录（优先级高于 --target）。",
+    )
+    pscl.add_argument(
+        "--json", action="store_true",
+        help="输出结构化 JSON 到 stdout（供程序消费）。",
+    )
+    pscl.set_defaults(func=_cmd_cases_list)
 
     return p
 
