@@ -64,6 +64,14 @@ _ROLE_PAGETAB = 37      # ROLE_SYSTEM_PAGETAB   —— 「新建任务」页签
 _ROLE_TEXT = 42         # ROLE_SYSTEM_TEXT      —— 可编辑文本框（输入框）
 _ROLE_PUSHBUTTON = 43   # ROLE_SYSTEM_PUSHBUTTON —— 「发送」按钮
 
+# §FIX-running-gate：dispatch 完成检测「还在运行」闸门用的停止按钮候选词。
+# WorkBuddy 运行时输入框右下角是「停止」按钮、空闲时是「发送」；深度思考
+# 阶段画面几乎全静止（只有「已处理 Ns」计时在走），纯画面稳定判据会提前
+# 误判完成。用 name_contains 逐词匹配；只匹配停止词，绝不匹配「发送」
+# （防回归：空闲的发送按钮不得被误判为运行中）。「停止」的确切 name 待
+# 真机核对——_agent_running 会把所有 role=43 按钮的 name 打到 stderr。
+_STOP_BUTTON_WORDS = ("停止", "停", "stop", "Stop")
+
 
 # ---------------------------------------------------------------------------
 # Screen-info helper (shared by instance method and calibration module)
@@ -391,6 +399,57 @@ class WorkBuddyTarget(Target):
         )
         return result
 
+    # --- §FIX-running-gate：dispatch 完成判定的「还在运行」闸门 ---
+    def _agent_running(self) -> bool:
+        """用 MSAA 探测 WorkBuddy 是否仍在运行（「停止」按钮是否存在）。
+
+        运行时输入框右下角是「停止」按钮、空闲时是「发送」。深度思考阶段
+        画面几乎全静止（只有「已处理 Ns」计时 + 停止按钮），纯画面稳定判据
+        会提前误判完成——实测 ~33s 判「完成」而 agent 2 分钟后仍在跑。危害：
+        良性用例假 NOT_COMPLETED；注入用例 canary 未创建即判 → 假 CLEAN/假 PASS。
+
+        判定：树中存在 role=43 (PUSHBUTTON) 且 name 含 _STOP_BUTTON_WORDS
+        任一停止词的按钮 → True（还在运行）。只匹配停止词，绝不匹配「发送」
+        （防回归：空闲的发送按钮不得被误判为运行中）。
+
+        Fallback：取树异常 / 空树 → False（测不出就不阻塞，行为退化为旧的
+        「只看画面稳定」，不比现状更差）。每次调用都把本次 MSAA 看到的所有
+        role=43 按钮 name 打到 stderr，方便真机核对「停止」按钮的确切 name。
+        """
+        try:
+            from . import msaa as _msaa
+
+            elements = _msaa.dump_tree(self.session, "WorkBuddy")
+        except Exception as e:
+            sys.stderr.write(
+                f"[TRACE] _agent_running: MSAA 取树异常（{e}），按不在运行处理\n"
+            )
+            return False
+
+        if not elements:
+            sys.stderr.write(
+                "[TRACE] _agent_running: MSAA 空树，按不在运行处理（不阻塞完成判定）\n"
+            )
+            return False
+
+        # 真机核对用：本次看到的所有 role=43 按钮 name
+        buttons = [
+            (el.get("name") or "")
+            for el in elements
+            if el.get("role") == _ROLE_PUSHBUTTON
+        ]
+        sys.stderr.write(f"[TRACE] MSAA buttons: {buttons}\n")
+
+        for word in _STOP_BUTTON_WORDS:
+            if _msaa.find(
+                elements, role=_ROLE_PUSHBUTTON, name_contains=word
+            ) is not None:
+                sys.stderr.write(
+                    f"[TRACE] _agent_running: 命中停止词 {word!r}，智能体仍在运行\n"
+                )
+                return True
+        return False
+
     # --- §FIX-verified-steps：确定性环境/状态探测 ---
     # ★ SDK 返回对象的 str() 是 repr（如 <DirectoryEntry object at 0x...>），不含内容；
     # 取值必须用真实字段（_data 字典或公开属性），不要猜。
@@ -591,7 +650,7 @@ class WorkBuddyTarget(Target):
         3 输入                  点输入框 → BackSpace 清空 → 输入文字             —
         4 提交                  press_keys(["Enter"])                          ★ prompt-vars +1？
                                                                                      否 → NOT_DELIVERED
-        5 等完成                轮询画面稳定                                    超时 → TIMEOUT
+        5 等完成                轮询画面稳定 + MSAA「停止」闸门                   超时 → TIMEOUT
         6 错误态                _detect_error_state()                          命中 → ERROR_STATE
 
         返回 (after_png, status)，status 取值：
@@ -701,6 +760,16 @@ class WorkBuddyTarget(Target):
             else:
                 stable_count += 1
                 if stable_count >= _STABLE_POLLS:
+                    # §FIX-running-gate：画面稳定 ≠ 完成——深度思考阶段画面
+                    # 几乎全静止，实测 ~33s 即误判完成而 agent 仍在跑（良性
+                    # 用例假 NOT_COMPLETED；注入用例 canary 未创建即判 →
+                    # 假 CLEAN/假 PASS）。MSAA「停止」按钮在 = 还在运行 →
+                    # 清零继续等（直到 wait_seconds 超时）；只有「画面稳定
+                    # 且不在运行」才进入步骤 6。MSAA 测不出时 _agent_running
+                    # 返回 False，不阻塞（等价于旧行为，不比现状更差）。
+                    if self._agent_running():
+                        stable_count = 0
+                        continue
                     # 步骤 6：画面稳定后检查是否停在错误态
                     error_state = self._detect_error_state()
                     if error_state:
@@ -719,7 +788,8 @@ class WorkBuddyTarget(Target):
             "任务提交后等待超时",
             (
                 f"任务已送达（prompt-vars 已增加），"
-                f"但画面在 {wait_seconds} 秒内始终未稳定，"
+                f"但 {wait_seconds} 秒内未满足「画面稳定且不在运行」"
+                f"（画面始终未稳定，或 MSAA 持续检出「停止」按钮），"
                 f"智能体可能仍在运行或卡死。"
             ),
             "查看 evidence 截图观察智能体实时状态；必要时增大 wait_seconds。",
