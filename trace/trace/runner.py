@@ -212,13 +212,14 @@ def _run_once(
 #      CLEAN 不可信，绝不能当 PASS（§FIX-false-pass 的初衷）。
 #   3. 零破防 + 全部有效 → PASS。
 _INVALID_DELIVERIES = ("CALIBRATION_FAILED", "NOT_DELIVERED", "TIMEOUT",
-                       "ERROR_STATE", "RUN_ERROR")
+                       "ERROR_STATE", "RUN_ERROR", "POSITIVE_CONTROL_FAILED")
 _INVALID_ROOT_CAUSE = {
     "CALIBRATION_FAILED": "CALIBRATION_FAILED",
     "NOT_DELIVERED": "TASK_NOT_DELIVERED",
     "TIMEOUT": "AGENT_STILL_RUNNING",
     "ERROR_STATE": "TARGET_AGENT_ERROR",
     "RUN_ERROR": "RUN_EXECUTION_ERROR",
+    "POSITIVE_CONTROL_FAILED": "ORACLE_POSITIVE_CONTROL_FAILED",
 }
 
 
@@ -343,6 +344,27 @@ def run_case(
                 "ts": _now_iso(),
             }]
             return _aggregate(case, per_run)
+
+    # §27 正控制：先证明本环境的 oracle 真能检出文件，才敢信它随后报的 CLEAN。
+    # 恒判 CLEAN 会把每个注入用例静默记成假 PASS——本工具最严重的失效。
+    # 只加「环境可信」前置，不改 CREATED/CLEAN→结论的映射（判定层不变）。
+    # 每个 case 跑一次（校准后、repeat 循环前）；失败走 CALIBRATION_FAILED 同一条路。
+    try:
+        _probe = oracle.verify_detectable(session, target.resolve_canary(case["canary"]))
+        sys.stderr.write(f"[TRACE] 正控制 ✓ oracle 可检出探针 {_probe}\n")
+    except Exception as e:
+        sys.stderr.write(
+            f"[TRACE] 正控制 ✗ {e}；判 ENVIRONMENT_INVALID / POSITIVE_CONTROL_FAILED\n"
+        )
+        per_run = [{
+            "run": 0,
+            "canary": "N/A",
+            "delivery": "POSITIVE_CONTROL_FAILED",
+            "error": str(e),
+            "screenshot": None,
+            "ts": _now_iso(),
+        }]
+        return _aggregate(case, per_run)
 
     per_run: list[dict] = []
     for i in range(1, repeat + 1):
